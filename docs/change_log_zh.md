@@ -2,6 +2,113 @@
 
 本文档用于记录后续每次修改。每条记录包含：修改原因、修改方案、结果优化。
 
+## 2026-04-29 Qwen fp16 TensorRT 与 ORT 数值对齐初查
+
+### 1. 优化背景
+
+- Qwen fp16 TensorRT engine 已经可以完成反序列化、59 输入 / 57 输出绑定和一次 `enqueueV3()`。
+- 当前 TensorRT 首 token 输出为 `id=0`，而预期应和 ONNX Runtime fp16/q4 的 logits argmax 对齐。
+- 需要先确认同一个 fp16 ONNX、同一个 prompt 在 ONNX Runtime CUDA 下的基准输出。
+
+### 2. 优化设计
+
+- 使用同一套 tokenizer/config 和同一个 prompt：
+  - prompt：`你好`
+  - `max_new_tokens=1`
+- 跑 ONNX Runtime CUDA fp16 baseline：
+  - `./build/qwen_cli_cpp --provider cuda --model models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_fp16.onnx --prompt '你好' --max-new-tokens 1`
+- 对比 TensorRT fp16 prefill engine：
+  - `./build/qwen_cli_cpp --provider tensorrt --model models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_fp16_prefill_b1_s20_p0.engine --prompt '你好' --max-new-tokens 1`
+
+### 3. 优化结果
+
+- ONNX Runtime fp16 CUDA baseline：
+  - 首 token：`108386`
+  - 解码文本：`你好`
+  - `infer_ms=643.135`
+  - `session_init_ms=3612.579`
+  - `tokens_per_second=1.555`
+  - 显存：session 后约 `4889 MiB`，prefill 后约 `4905 MiB`。
+- TensorRT fp16 prefill engine：
+  - 首 token：`0`
+  - 解码文本：`!`
+  - `infer_ms=50.846`
+  - `session_init_ms=4944.945`
+  - `tokens_per_second=19.667`
+  - 显存：session 后约 `3913 MiB`。
+- 结果说明 tokenizer/config/prompt 不是差异来源；当前问题集中在 TensorRT engine profile、0 长度 KV cache 支持、TensorRT 数值精度或后端数据搬运/类型转换。
+
+### 4. 问题细节
+
+- 现象：
+  - 同一 prompt、同一 fp16 模型权重、同一 C++ tokenizer/config 路径下，ORT CUDA 与 TensorRT 的首 token argmax 不一致。
+  - ORT fp16 首 token 为 `108386`，可解码为 `你好`。
+  - TensorRT fp16 首 token 为 `0`，当前 decoder 输出为 `!`。
+- 已确认正常的部分：
+  - TensorRT engine 可以反序列化。
+  - 59 个输入和 57 个输出均能通过 named IO tensor API 识别。
+  - `input_ids`、`attention_mask`、`position_ids` 的 dtype 在 TensorRT engine 中保持为 `int64`。
+  - KV cache 输入输出 shape 能完成绑定，`enqueueV3()` 能返回 `logits` 和 `present.*`。
+  - 同一套 tokenizer/config 在 ORT fp16 下输出正常，因此 tokenization、prompt template、EOS 配置不是主要问题。
+- 高风险可疑点：
+  - 初始 prefill 使用 `past_key_values.*=[1,2,0,128]`，TensorRT 虽然能构建 0 长度动态维度 profile，但实际 kernel/shape 传播可能产生异常 logits。
+  - 当前 TensorRT engine 是固定 profile engine，prompt 长度、attention 长度、past 长度必须完全命中 profile；任何阶段 shape 不匹配都会直接失败或产生不可预期行为。
+  - TensorRT 构建时提示 fp16 layernorm 可能溢出：`Running layernorm after self-attention with FP16 Reduce or Pow may cause overflow`，后续可能需要对 layernorm/reduce/pow 约束 FP32。
+  - `TensorRtBackend` 当前会把 TensorRT `float16` 输出转存到 `Tensor::data` 的 float 容器，也会处理 `int64` 输入；虽然 smoke engine 已验证拷贝路径可用，但仍需要用 logits 分布确认数据搬运是否正确。
+
+### 5. 解决方案 / 下一步优化
+
+- 增加 logits 调试输出：
+  - 在 `qwen_cli_cpp` 中增加可选 debug 输出，打印最后一个 token logits 的 `min/max/argmax/top-k`。
+  - 分别跑 ORT fp16、ORT q4、TensorRT fp16，确认 TensorRT 是整体 logits 分布异常，还是只有 argmax 局部偏移。
+  - 如果 TensorRT logits 大量为 0、NaN、Inf 或范围明显异常，优先排查输出拷贝、dtype 转换和 0 长度 KV。
+- 验证 0 长度 KV cache：
+  - 构造 past_len=1 的零 KV cache 作为首轮输入，使用 `attention_mask=[1,prompt_len+1]`、`position_ids` 保持 prompt 位置。
+  - 使用已生成的 p1 profile 或重新生成匹配 profile，观察 TensorRT 首 token 是否从 `0` 恢复到 ORT 的 `108386`。
+  - 如果 past_len=1 正常，则说明 TensorRT 对 `[1,2,0,128]` 初始 KV profile 不可靠，后续方案是首轮 prefill 使用无 past 的模型导出，或统一用非零 dummy past profile。
+- 修正 TensorRT profile 策略：
+  - 生成覆盖 prefill/decode 的多 profile engine，例如 profile0 覆盖 prefill，profile1 覆盖 decode。
+  - 在 `TensorRtBackend` 中增加 profile 选择逻辑，根据输入 shape 选择对应 optimization profile。
+  - 在文档中明确 prompt_len、past_len、attention_len 的 profile 约束，避免 engine 和运行时输入 shape 不一致。
+- 处理 fp16 精度风险：
+  - 若 logits 分布显示 fp16 layernorm/attention 数值异常，尝试对 layernorm/reduce/pow 设置 FP32 精度约束，或导出 opset >= 17 使用 `INormalizationLayer`。
+  - 保留 ORT fp16/q4 的首 token 和 top-k 作为回归基线，避免只看生成文本造成误判。
+
+### 6. logits 调试结果
+
+- 已在 `qwen_cli_cpp` 中增加：
+  - `--debug-logits`
+  - `--logits-top-k N`
+- ORT fp16 CUDA baseline：
+  - 命令：`./build/qwen_cli_cpp --provider cuda --model models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_fp16.onnx --prompt '你好' --max-new-tokens 1 --debug-logits --logits-top-k 5`
+  - logits 范围：`min=-17.5`，`max=23.8125`
+  - `nan_count=0`
+  - `inf_count=0`
+  - top5：`108386:23.8125,111308:19.6094,99466:16.8906,9707:15.9844,112488:15.0703`
+  - 首 token：`108386`
+- TensorRT fp16 prefill engine：
+  - 命令：`./build/qwen_cli_cpp --provider tensorrt --model models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_fp16_prefill_b1_s20_p0.engine --prompt '你好' --max-new-tokens 1 --debug-logits --logits-top-k 5`
+  - logits 异常：最后一个 token 的 `151936` 个 vocab logits 全部为 `NaN`。
+  - 因为 logits 全部为 `NaN`，后续 `std::max_element` 的 argmax 不再有数值意义，当前生成 `id=0` 只是 NaN 比较下的未定义业务结果。
+- 新结论：
+  - TensorRT 与 ORT 的差异不是“局部 top-k 偏移”，而是 TensorRT 输出 logits 已整体变成 NaN。
+  - 下一步优先排查 0 长度 KV cache profile 和 fp16 layernorm/reduce/pow 精度，而不是 tokenizer 或采样逻辑。
+
+### 7. past_len=1 零 KV cache 验证
+
+- 已在 `qwen_cli_cpp` 增加 `--initial-zero-past-len N` 调试参数：
+  - 仅在首轮没有真实 `past` 时生效。
+  - KV cache 输入 shape 从 `[1,2,0,128]` 改为 `[1,2,N,128]`，内容为全 0。
+  - `attention_mask` 长度改为 `N + prompt_len`。
+  - `position_ids` 仍保持 prompt 原始位置，即 `0..prompt_len-1`。
+- 使用已生成的 p1 engine 验证：
+  - 命令：`./build/qwen_cli_cpp --provider tensorrt --model models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_fp16_prefill_b1_s20_p1.engine --prompt '你好' --max-new-tokens 1 --debug-logits --logits-top-k 5 --initial-zero-past-len 1`
+  - TensorRT 输入确认命中 p1 profile：`attention_mask=[1,21]`，`past_key_values.*=[1,2,1,128]`。
+  - 输出仍为：`finite_count=0`，`nan_count=151936`，`inf_count=0`。
+- 新结论：
+  - `past_len=1` 零 KV cache 没有修复 NaN，因此问题不只是 0 长度动态维度 profile。
+  - 后续重点应转向 TensorRT fp16 构建精度：优先尝试关闭 fp16 或对 layernorm/reduce/pow 等节点强制 FP32，再与 ORT fp16 logits top-k 做回归对比。
+
 ## 2026-04-29 Qwen2.5-1.5B fp16 TensorRT engine 验证
 
 ### 1. 优化背景

@@ -1,8 +1,11 @@
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <cstdio>
 #include <sstream>
@@ -65,8 +68,17 @@ std::vector<mini_infer::Tensor> BuildInputs(
     const mini_infer::LlmModelConfig& config,
     const std::vector<int64_t>& all_token_ids,
     const std::vector<int64_t>& current_token_ids,
-    const std::unordered_map<std::string, mini_infer::Tensor>& past) {
-    const std::size_t past_len = all_token_ids.size() - current_token_ids.size();
+    const std::unordered_map<std::string, mini_infer::Tensor>& past,
+    int64_t initial_zero_past_len) {
+    if (all_token_ids.size() < current_token_ids.size()) {
+        throw std::runtime_error("all_token_ids must include current_token_ids");
+    }
+    const std::size_t token_past_len = all_token_ids.size() - current_token_ids.size();
+    const bool use_initial_zero_past = past.empty() && initial_zero_past_len >= 0;
+    const std::size_t kv_past_len = use_initial_zero_past
+        ? static_cast<std::size_t>(initial_zero_past_len)
+        : token_past_len;
+    const std::size_t attention_len = kv_past_len + current_token_ids.size();
 
     std::vector<mini_infer::Tensor> inputs;
     inputs.reserve(3 + static_cast<std::size_t>(config.num_layers) * 2);
@@ -76,12 +88,12 @@ std::vector<mini_infer::Tensor> BuildInputs(
         current_token_ids));
     inputs.push_back(MakeInt64Tensor(
         "attention_mask",
-        {1, static_cast<int64_t>(all_token_ids.size())},
-        Ones(all_token_ids.size())));
+        {1, static_cast<int64_t>(attention_len)},
+        Ones(attention_len)));
     inputs.push_back(MakeInt64Tensor(
         "position_ids",
         {1, static_cast<int64_t>(current_token_ids.size())},
-        Positions(past_len, current_token_ids.size())));
+        Positions(token_past_len, current_token_ids.size())));
 
     for (int layer = 0; layer < config.num_layers; ++layer) {
         for (const std::string& name : {
@@ -95,7 +107,7 @@ std::vector<mini_infer::Tensor> BuildInputs(
                     name,
                     {1,
                      config.num_kv_heads,
-                     static_cast<int64_t>(past_len),
+                     static_cast<int64_t>(kv_past_len),
                      config.head_dim}));
             }
         }
@@ -130,6 +142,96 @@ int64_t ArgmaxLastToken(const mini_infer::Tensor& logits, int expected_vocab_siz
     return static_cast<int64_t>(std::distance(begin, std::max_element(begin, end)));
 }
 
+void PrintLogitsDebug(
+    const mini_infer::Tensor& logits,
+    int expected_vocab_size,
+    int step,
+    int top_k) {
+    if (logits.elem_type != mini_infer::TensorElementType::FLOAT32 || logits.shape.size() != 3) {
+        throw std::runtime_error("logits must be float32 [batch, seq, vocab]");
+    }
+    const int64_t seq_len = logits.shape[1];
+    const int64_t vocab_size = logits.shape[2];
+    if (seq_len <= 0 || vocab_size <= 0 || vocab_size != expected_vocab_size) {
+        throw std::runtime_error("unexpected logits shape");
+    }
+    const std::size_t offset = static_cast<std::size_t>((seq_len - 1) * vocab_size);
+    const auto begin = logits.data.begin() + static_cast<std::ptrdiff_t>(offset);
+    const auto end = begin + static_cast<std::ptrdiff_t>(vocab_size);
+
+    float min_value = std::numeric_limits<float>::infinity();
+    float max_value = -std::numeric_limits<float>::infinity();
+    std::size_t nan_count = 0;
+    std::size_t inf_count = 0;
+    std::size_t finite_count = 0;
+    int64_t finite_argmax = -1;
+    for (auto it = begin; it != end; ++it) {
+        const float value = *it;
+        if (std::isnan(value)) {
+            ++nan_count;
+            continue;
+        }
+        if (std::isinf(value)) {
+            ++inf_count;
+        }
+        min_value = std::min(min_value, value);
+        max_value = std::max(max_value, value);
+        if (std::isfinite(value)) {
+            ++finite_count;
+            const int64_t id = static_cast<int64_t>(std::distance(begin, it));
+            if (finite_argmax < 0 || value > *(begin + finite_argmax)) {
+                finite_argmax = id;
+            }
+        }
+    }
+
+    top_k = std::max(1, std::min<int>(top_k, static_cast<int>(vocab_size)));
+    std::vector<int64_t> indices(static_cast<std::size_t>(vocab_size));
+    for (int64_t i = 0; i < vocab_size; ++i) {
+        indices[static_cast<std::size_t>(i)] = i;
+    }
+    const auto kth = indices.begin() + top_k;
+    std::partial_sort(
+        indices.begin(),
+        kth,
+        indices.end(),
+        [&](int64_t lhs, int64_t rhs) {
+            const float lhs_value = *(begin + lhs);
+            const float rhs_value = *(begin + rhs);
+            const bool lhs_finite = std::isfinite(lhs_value);
+            const bool rhs_finite = std::isfinite(rhs_value);
+            if (!lhs_finite && !rhs_finite) {
+                return lhs < rhs;
+            }
+            if (!lhs_finite) {
+                return false;
+            }
+            if (!rhs_finite) {
+                return true;
+            }
+            return lhs_value > rhs_value;
+        });
+
+    std::cout << "[logits_debug] step=" << step
+              << " seq_len=" << seq_len
+              << " vocab_size=" << vocab_size
+              << " min=" << min_value
+              << " max=" << max_value
+              << " finite_count=" << finite_count
+              << " nan_count=" << nan_count
+              << " inf_count=" << inf_count
+              << " finite_argmax=" << finite_argmax
+              << " top" << top_k << "=";
+    for (int i = 0; i < top_k; ++i) {
+        const int64_t id = indices[static_cast<std::size_t>(i)];
+        if (i > 0) {
+            std::cout << ",";
+        }
+        std::cout << id << ":" << *(begin + id);
+    }
+    std::cout << "\n";
+}
+
 std::unordered_map<std::string, mini_infer::Tensor> ExtractPast(
     const mini_infer::LlmModelConfig& config,
     const std::vector<mini_infer::Tensor>& outputs) {
@@ -154,7 +256,9 @@ void PrintUsage(const char* argv0) {
               << " [--model <model.onnx>] [--vocab <vocab.json>] [--merges <merges.txt>]"
               << " [--config <config.json>] [--generation-config <generation_config.json>]"
               << " [--prompt <text>] [--system <text>]"
-              << " [--provider cpu|cuda|tensorrt] [--max-new-tokens N]\n";
+              << " [--provider cpu|cuda|tensorrt] [--max-new-tokens N]"
+              << " [--debug-logits] [--logits-top-k N]"
+              << " [--initial-zero-past-len N]\n";
 }
 
 std::string Trim(std::string text) {
@@ -233,6 +337,9 @@ int main(int argc, char** argv) {
     std::string system = "You are a helpful assistant.";
     std::string provider = "cuda";
     int max_new_tokens = 2;
+    bool debug_logits = false;
+    int logits_top_k = 5;
+    int64_t initial_zero_past_len = -1;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -254,6 +361,12 @@ int main(int argc, char** argv) {
             provider = argv[++i];
         } else if (arg == "--max-new-tokens" && i + 1 < argc) {
             max_new_tokens = std::stoi(argv[++i]);
+        } else if (arg == "--debug-logits") {
+            debug_logits = true;
+        } else if (arg == "--logits-top-k" && i + 1 < argc) {
+            logits_top_k = std::stoi(argv[++i]);
+        } else if (arg == "--initial-zero-past-len" && i + 1 < argc) {
+            initial_zero_past_len = std::stoll(argv[++i]);
         } else if (arg == "-h" || arg == "--help") {
             PrintUsage(argv[0]);
             return 0;
@@ -276,6 +389,13 @@ int main(int argc, char** argv) {
 #endif
     if (max_new_tokens < 1) {
         max_new_tokens = 1;
+    }
+    if (logits_top_k < 1) {
+        logits_top_k = 1;
+    }
+    if (initial_zero_past_len < -1) {
+        std::cerr << "--initial-zero-past-len must be >= 0, or omitted\n";
+        return 2;
     }
 
     try {
@@ -315,6 +435,9 @@ int main(int argc, char** argv) {
             std::cout << " " << id;
         }
         std::cout << "\n";
+        if (initial_zero_past_len >= 0) {
+            std::cout << "[initial_zero_past_len] " << initial_zero_past_len << "\n";
+        }
 
         std::unordered_map<std::string, mini_infer::Tensor> past;
         std::vector<int64_t> generated;
@@ -324,7 +447,12 @@ int main(int argc, char** argv) {
         std::string gpu_after_prefill = "not_run";
 
         for (int step = 0; step < max_new_tokens; ++step) {
-            auto inputs = BuildInputs(model_config, token_ids, current_ids, past);
+            auto inputs = BuildInputs(
+                model_config,
+                token_ids,
+                current_ids,
+                past,
+                initial_zero_past_len);
             const auto infer_start = Clock::now();
             auto outputs = runtime.infer_many(inputs);
             const auto infer_end = Clock::now();
@@ -337,6 +465,9 @@ int main(int argc, char** argv) {
             }
 
             const auto& logits = FindOutput(outputs, "logits");
+            if (debug_logits) {
+                PrintLogitsDebug(logits, model_config.vocab_size, step, logits_top_k);
+            }
             const int64_t next_id = ArgmaxLastToken(logits, model_config.vocab_size);
             std::cout << "[token] step=" << step
                       << " id=" << next_id
