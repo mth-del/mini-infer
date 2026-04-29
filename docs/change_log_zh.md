@@ -2,6 +2,192 @@
 
 本文档用于记录后续每次修改。每条记录包含：修改原因、修改方案、结果优化。
 
+## 2026-04-29 Qwen2.5-1.5B fp16 TensorRT engine 验证
+
+### 1. 优化背景
+
+- Qwen q4 ONNX 使用 `com.microsoft::MatMulNBits`，TensorRT 10.16 parser 缺少对应 plugin，无法直接转换为 engine。
+- Qwen fp16 ONNX 使用外部权重格式：
+  - `model_fp16.onnx` 约 1.1MB，只保存计算图和外部权重索引。
+  - `model_fp16.onnx_data` 约 2.9GB，保存真实 fp16 权重。
+- 当前目标是验证 Qwen fp16 ONNX 能否生成 TensorRT engine，并通过项目原生 `TensorRtBackend` 跑通一次真实 `enqueueV3()`。
+
+### 2. 优化设计
+
+- 使用 `curl -C -` 断点续传下载：
+  - `models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_fp16.onnx`
+  - `models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_fp16.onnx_data`
+- 使用 `onnx_model_info` 验证 fp16 ONNX 可被正常读取：
+  - 输入 59 个 tensor。
+  - 输出 57 个 tensor。
+  - token 输入为 `int64`，KV cache 为 `float32`。
+- 先生成 decode profile engine：
+  - `input_ids=[1,1]`
+  - `attention_mask=[1,2]`
+  - `position_ids=[1,1]`
+  - `past_key_values.*=[1,2,1,128]`
+- 再根据当前 `qwen_cli_cpp --prompt '你好'` 的实际 prefill 形状生成 prefill profile engine：
+  - `input_ids=[1,20]`
+  - `attention_mask=[1,20]`
+  - `position_ids=[1,20]`
+  - 初始 `past_key_values.*=[1,2,0,128]`
+
+### 3. 优化结果
+
+- fp16 文件大小确认：
+  - `model_fp16.onnx`: `1,098,300` bytes。
+  - `model_fp16.onnx_data`: `3,104,177,152` bytes。
+- decode profile engine 构建通过：
+  - `models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_fp16_decode_b1_s1_p1.engine`
+  - engine size: `3391.6 MiB`
+  - build time: `24.0842 sec`
+  - deserialize time: `2.6606 sec`
+- prefill profile engine 构建通过：
+  - `models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_fp16_prefill_b1_s20_p0.engine`
+  - engine size: `3391.9 MiB`
+  - build time: `25.0616 sec`
+  - deserialize time: `2.6052 sec`
+- 项目原生 TensorRT 后端已跑通 Qwen fp16 prefill engine：
+  - 命令：`./build/qwen_cli_cpp --provider tensorrt --model models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_fp16_prefill_b1_s20_p0.engine --prompt '你好' --max-new-tokens 1`
+  - 识别 59 个 TensorRT 输入和 57 个输出。
+  - `Native TensorRT backend initialized`。
+  - `infer_ms=50.846`
+  - `session_init_ms=4944.945`
+  - `tokens_per_second=19.667`
+  - 显存：session 初始化后约 `3913 MiB`。
+- 当前 TensorRT 输出 token 为 `id=0`，说明执行链路已经跑通，但数值正确性还需要继续和 ONNX Runtime fp16/q4 输出对齐。
+
+### 4. 下一步优化
+
+- 对比 ONNX Runtime fp16 与 TensorRT fp16 的 logits argmax，确认 `id=0` 是 profile/输入问题、精度问题还是数据拷贝/类型转换问题。
+- 生成同时覆盖 prefill 与 decode 的多 profile engine，避免每个阶段需要单独 engine。
+- 给 `qwen_cli_cpp` 增加 TensorRT profile/engine 使用说明，明确 prompt 长度、past 长度和 attention mask 必须落在 engine optimization profile 范围内。
+
+## 2026-04-29 原生 TensorRT engine 生成与执行验证
+
+### 1. 优化背景
+
+- TensorRT 10.16 SDK 已完成 CMake 接入，原生 TensorRT 分支可以编译。
+- 下一步需要生成真实 `.engine` 文件，并通过项目自己的 `TensorRtBackend` 验证 engine 反序列化和 `enqueueV3()` 执行路径。
+- 当前本地 Qwen q4 ONNX 模型为 `models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_q4.onnx`，输入包含 59 个动态 tensor。
+
+### 2. 优化设计
+
+- 先尝试使用 `trtexec` 为 Qwen q4 ONNX 构建 decode profile：
+  - `input_ids=[1,1]`
+  - `attention_mask=[1,2]`
+  - 每层 `past_key_values.*.{key,value}=[1,2,1,128]`
+- 修正 TensorRT 10 的命令行差异：
+  - TensorRT 10 已不接受旧参数 `--explicitBatch`，需要移除。
+- 由于 Qwen q4 ONNX 使用 `com.microsoft::MatMulNBits`，TensorRT parser 缺少对应 plugin，无法直接生成 engine。
+- 为了验证项目原生 TensorRT 后端本身，新增一个最小 smoke ONNX：
+  - 输入：`images`，shape `[1,3,640,640]`。
+  - 输出：`output`，shape `[1,25200,85]`，匹配现有 `infer_cli` 的 YOLO 输出解析路径。
+  - 使用 `trtexec` 生成 `models/trt_smoke.engine`。
+- 更新 `tools/infer_cli.cpp`：
+  - 增加 `--model` 作为 `-m` 别名。
+  - 增加 `--provider` 作为 `-d` 别名。
+  - 当 `--provider tensorrt` 且模型为 `.engine` 时，跳过 ONNX Runtime 的模型输入探测，使用默认 smoke 输入 `images:[1,3,640,640]`。
+
+### 3. 优化结果
+
+- Qwen q4 转 TensorRT engine 当前失败原因明确：
+  - `MatMulNBits`，domain 为 `com.microsoft`。
+  - TensorRT 报错：`Plugin not found, are the plugin name, version, and namespace correct?`
+- smoke ONNX 成功生成 TensorRT engine：
+  - `models/trt_smoke.onnx`
+  - `models/trt_smoke.engine`
+- 项目原生 TensorRT 后端验证通过：
+  - `LD_LIBRARY_PATH=/root/autodl-tmp/tensorrt/TensorRT-10.16.1.11/lib:/root/mth/code_space/mini-infer/src/backends/onnx/lib:$LD_LIBRARY_PATH ./build/infer_cli --provider tensorrt --model models/trt_smoke.engine -l 1`
+- 运行输出确认：
+  - `TensorRT input name=images dtype=float32 shape=[1,3,640,640]`
+  - `TensorRT output name=output dtype=float32 shape=[1,25200,85]`
+  - `Native TensorRT backend initialized`
+  - `Backend: tensorrt-native`
+  - `Inference time(avg): 21.855 ms`
+  - `Detections after NMS: 0`
+- 当前测试通过：
+  - `ctest --test-dir build --output-on-failure`
+- `tools/infer_cli.cpp` 和 `docs/change_log_zh.md` linter 检查无新增问题。
+
+### 4. 下一步优化
+
+- 若要继续 Qwen TensorRT 路线，需要改用 TensorRT 支持的 fp16/fp32 ONNX，或引入支持 `MatMulNBits` 的 TensorRT plugin/转换流程。
+- 为 `trt_smoke.onnx` 增加可复现生成脚本，避免只保留一次性生成产物。
+- 后续可把 TensorRT engine smoke test 纳入 CTest，但需要检测本机是否存在 TensorRT SDK 和 GPU。
+
+## 2026-04-29 TensorRT 10.16 SDK 接入验证
+
+### 1. 优化背景
+
+- 已在当前机器解压 TensorRT SDK：`/root/autodl-tmp/tensorrt/TensorRT-10.16.1.11`。
+- SDK 目录包含 `include/NvInfer.h`、`lib/libnvinfer.so` 和 `lib/libnvonnxparser.so`，可以进入原生 TensorRT 编译路径。
+- 首次启用 `MINI_INFER_TENSORRT_NATIVE=1` 编译时，TensorRT 头文件继续包含 `cuda_runtime_api.h`，但原 CMake 只链接 `cudart`，没有把 CUDA runtime include 目录加入 `mini_infer_core`。
+
+### 2. 优化设计
+
+- 使用以下命令重新配置 CMake：
+  - `cmake -S . -B build -DMINI_INFER_ENABLE_ONNXRUNTIME=ON -DMINI_INFER_ENABLE_ORT_CUDA=ON -DMINI_INFER_ENABLE_TENSORRT=ON -DTENSORRT_ROOT=/root/autodl-tmp/tensorrt/TensorRT-10.16.1.11`
+- 更新 `CMakeLists.txt`：
+  - 查找 `cuda_runtime_api.h`。
+  - 增加 `/usr/local/cuda-12.8/targets/x86_64-linux/include` 和对应 CUDA library hint。
+  - 只有在 TensorRT include、`libnvinfer`、`cudart` 和 CUDA runtime include 都找到时，才启用 `MINI_INFER_TENSORRT_NATIVE=1`。
+  - native TensorRT 分支同时加入 TensorRT include 和 CUDA runtime include。
+
+### 3. 优化结果
+
+- CMake 已识别原生 TensorRT：
+  - `Native TensorRT backend enabled: /root/autodl-tmp/tensorrt/TensorRT-10.16.1.11/lib/libnvinfer.so`
+- 原生 TensorRT 分支构建通过：
+  - `cmake --build build -j2`
+- 设置 TensorRT library path 后测试通过：
+  - `LD_LIBRARY_PATH=/root/autodl-tmp/tensorrt/TensorRT-10.16.1.11/lib:$LD_LIBRARY_PATH ctest --test-dir build --output-on-failure`
+- `qwen_cli_cpp --help` 已展示 `--provider cpu|cuda|tensorrt`。
+- `CMakeLists.txt`、`src/backends/tensorrt/tensorrt_backend.cpp` 和 `tools/qwen_cli.cpp` linter 检查无新增问题。
+
+### 4. 下一步优化
+
+- 生成或准备真实 TensorRT `.engine`，再用 `--provider tensorrt --model <model.engine>` 验证 engine 反序列化和 `enqueueV3()`。
+- 将 TensorRT SDK `lib` 路径固化为运行文档中的 `LD_LIBRARY_PATH` 步骤，或后续补充可选 RPATH 配置。
+- 继续补充 Qwen ONNX 到 TensorRT engine 的 `trtexec` profile 参数。
+
+## 2026-04-29 原生 TensorRT 后端执行路径适配
+
+### 1. 优化背景
+
+- 前序已经搭建原生 TensorRT 后端框架，能够完成 engine 文件读取、`IRuntime`/`ICudaEngine`/`IExecutionContext` 创建和 CUDA stream 初始化。
+- `TensorRtBackend::run_many()` 仍然直接抛出 `Native TensorRT execution buffers are not implemented yet`，无法实际执行 engine。
+- Qwen CLI 只能选择 `cpu` 或 `cuda` ONNX Runtime 后端，不能直接走原生 TensorRT engine。
+
+### 2. 优化设计
+
+- 更新 `src/backends/tensorrt/tensorrt_backend.cpp`：
+  - 使用 TensorRT 8.5+ named IO tensor API 读取 engine 输入/输出名称、dtype 和 shape。
+  - 初始化时打印 TensorRT engine binding inspection 信息，便于核对模型 IO。
+  - 在 `run_many()` 中按 engine 输入名匹配 `Tensor`，设置动态输入 shape。
+  - 增加 CUDA device buffer RAII 封装，负责输入/输出显存申请和释放。
+  - 支持 `float32`、`float16`、`int32`/`int64` 输入输出转换；其中 TensorRT `int32` 输出回填为当前 `Tensor` 可表达的 `INT64`。
+  - 使用 `setTensorAddress()`、`enqueueV3()`、H2D/D2H copy 和 `cudaStreamSynchronize()` 完成最小原生 TensorRT 推理路径。
+- 更新 `tools/qwen_cli.cpp`：
+  - `--provider` 增加 `tensorrt` 选项。
+  - 当构建启用 TensorRT backend 时，`--provider tensorrt` 使用 `TensorRtBackend` 加载指定 engine。
+  - 当构建未启用 TensorRT backend 时，给出明确错误提示。
+
+### 3. 优化结果
+
+- 当前无 TensorRT SDK 的环境仍可正常构建 stub 路径：
+  - `cmake --build build -j2`
+- 当前测试通过：
+  - `ctest --test-dir build --output-on-failure`
+- `src/backends/tensorrt/tensorrt_backend.cpp` 和 `tools/qwen_cli.cpp` linter 检查无新增问题。
+- 安装 TensorRT SDK 并重新 CMake 后，可以用原生 TensorRT backend 进入真实执行路径，不再停留在初始化后抛错。
+
+### 4. 下一步优化
+
+- 在安装 TensorRT SDK 的环境中用真实 `.engine` 文件验证 `MINI_INFER_TENSORRT_NATIVE=1` 路径。
+- 补充 ONNX 到 TensorRT engine 的生成文档，优先记录 `trtexec` 命令和 Qwen 动态 shape/profile 参数。
+- 根据真实 engine 的 IO dtype 决定是否需要给 `Tensor` 增加原生 `INT32`/raw bytes 表达，减少当前 `INT64` 到 TensorRT `int32` 的临时转换。
+
 ## 2026-04-29 Qwen2.5-1.5B ONNX CUDA 部署前置调整
 
 ### 修改原因
@@ -896,3 +1082,125 @@
 - 增加 tokenizer 单元测试，把当前两个已对齐 Python 的 prompt token ids 固化为 golden case。
 - 后续将 `QwenTokenizer` 的 pre-tokenizer 覆盖范围扩展到更多英文、数字、换行和符号混合输入。
 - 继续保持 `qwen_cli_cpp` 作为端到端回归入口，避免 tokenizer 优化破坏推理链路。
+
+## 2026-04-29 Qwen2.5-1.5B q4 LLM 模型配置化
+
+### 1. 优化背景
+
+- `qwen_cli_cpp` 中仍硬编码了 Qwen2.5-1.5B 的层数、KV head 数、head dim、vocab size、EOS token 和 KV cache 名称。
+- 这些常量会阻碍后续适配 Qwen2/Qwen2.5 同族不同尺寸模型，例如 0.5B、3B、7B。
+- 当前目标是先把模型结构参数和停止 token 从代码中抽出，改为从 `config.json` / `generation_config.json` 读取。
+
+### 2. 优化设计
+
+- 新增 `include/runtime/llm_config.h`。
+- 新增 `src/runtime/llm_config.cpp`。
+- 新增 `LlmModelConfig`：
+  - `num_layers`
+  - `num_kv_heads`
+  - `head_dim`
+  - `vocab_size`
+  - `bos_token_id`
+  - `eos_token_id`
+  - `pad_token_id`
+  - `end_token_id`
+  - `im_start_token_id`
+  - `stop_token_ids`
+  - KV cache 输入输出名称 pattern。
+- 新增 `LoadLlmModelConfig(config_path, generation_config_path)`：
+  - 从 `config.json` 读取 `num_hidden_layers`、`num_key_value_heads`、`hidden_size`、`num_attention_heads`、`vocab_size`、`bos_token_id`、`eos_token_id`。
+  - 从 `generation_config.json` 读取 `eos_token_id` 数组和 `pad_token_id`。
+  - 根据 `hidden_size / num_attention_heads` 计算 `head_dim`。
+- 新增 `FormatLayerName(pattern, layer)`，用于生成 `past_key_values.N.key`、`present.N.value` 等名称。
+- 更新 `qwen_cli_cpp`：
+  - 新增 `--config` 和 `--generation-config` 参数。
+  - `BuildInputs()` 使用配置中的层数、KV head 数和 head dim。
+  - `ExtractPast()` 使用配置中的 KV 名称 pattern。
+  - `ArgmaxLastToken()` 使用配置中的 vocab size。
+  - EOS 判断使用配置中的 `stop_token_ids`。
+- 更新 `CMakeLists.txt`，将 `src/runtime/llm_config.cpp` 加入 `mini_infer_core`。
+
+### 3. 优化结果
+
+- 构建通过：
+  - `cmake --build build -j2`
+- 当前 Qwen2.5-1.5B q4 回归验证通过：
+  - 命令：`./build/qwen_cli_cpp --provider cuda --prompt '你好，简短介绍一下你自己。' --max-new-tokens 8`
+- 配置化后 prompt token ids 保持不变：
+  - `151644 8948 198 2610 525 264 10950 17847 13 151645 198 151644 872 198 108386 3837 98237 99534 109432 107828 1773 151645 198 151644 77091 198`
+- 配置化后生成文本保持正常：
+  - `你好！我是一个人工智能助手，可以`
+- 本次 timing：
+  - `session_init_ms=7505.026`
+  - `prefill_ms=347.926`
+  - `decode_ms=77.381`
+  - `decode_avg_ms=11.054`
+  - `generated_tokens=8`
+  - `tokens_per_second=18.810`
+  - `total_ms=8181.990`
+- `ctest --test-dir build --output-on-failure` 通过。
+- `tools/qwen_cli.cpp`、`src/runtime/llm_config.cpp`、`include/runtime/llm_config.h` 和 `CMakeLists.txt` linter 检查无新增问题。
+
+### 4. 下一步优化
+
+- 将 Qwen chat special token id（如 `<|im_start|>`）也从 tokenizer 配置中读取，减少 Qwen 专用硬编码。
+- 增加 `LlmModelConfig` 单元测试，验证当前 Qwen config 解析出的层数、head dim、vocab size 和 stop token。
+- 后续尝试替换为 Qwen2.5 0.5B/3B ONNX，验证同族模型是否只需要更换模型目录和配置文件。
+
+## 2026-04-29 原生 TensorRT 后端框架搭建
+
+### 1. 优化背景
+
+- 现有 `TensorRtBackend` 只是 skeleton：`init()` 仅检查 `libnvinfer.so`，`run_many()` 直接返回输入透传，不是真实推理。
+- 用户希望先搭建原生 TensorRT 后端，而不是走 ONNX Runtime TensorRT Execution Provider。
+- 当前机器未安装原生 TensorRT SDK/runtime：
+  - `libnvinfer` 未找到。
+  - `libnvonnxparser` 未找到。
+  - `trtexec` 未找到。
+  - `NvInfer.h` 未找到。
+- 因此本轮重点是建立可编译的原生 TensorRT 工程结构，并在缺少 SDK 时给出明确不可用提示。
+
+### 2. 优化设计
+
+- 更新 `CMakeLists.txt`：
+  - 新增 `TENSORRT_ROOT` cache path。
+  - 探测 `NvInfer.h`。
+  - 探测 `libnvinfer`。
+  - 探测 `libnvonnxparser`。
+  - 探测 `libcudart`。
+  - 如果 SDK 完整，定义 `MINI_INFER_TENSORRT_NATIVE=1` 并链接 TensorRT/CUDA runtime。
+  - 如果 SDK 不完整，仍构建 TensorRT backend，但作为 unavailable stub。
+- 更新 `TensorRtBackend`：
+  - 增加 PIMPL，避免头文件暴露 TensorRT 类型。
+  - 增加析构函数，后续负责释放 CUDA stream 和 TensorRT 资源。
+  - 在 `MINI_INFER_TENSORRT_NATIVE` 路径中搭建：
+    - TensorRT logger。
+    - engine 文件读取。
+    - `createInferRuntime()`。
+    - `deserializeCudaEngine()`。
+    - `createExecutionContext()`。
+    - `cudaSetDevice()`。
+    - `cudaStreamCreate()`。
+  - 在没有 TensorRT SDK 的构建中，`init()` 明确报错并返回 false。
+- 修正 `OrtBackend` 前序未完成的 provider 枚举改动，保持现有 ONNX CPU/CUDA 构建正常。
+
+### 3. 优化结果
+
+- 当前环境 CMake 明确提示：
+  - `Native TensorRT SDK not found. TensorRT backend will build as an unavailable stub.`
+- 构建通过：
+  - `cmake -S . -B build -DMINI_INFER_ENABLE_ONNXRUNTIME=ON -DMINI_INFER_ENABLE_ORT_CUDA=ON -DMINI_INFER_ENABLE_TENSORRT=ON`
+  - `cmake --build build -j2`
+- 无 TensorRT SDK 时运行 `tensorrt` 后端会明确失败：
+  - `Native TensorRT backend unavailable: libnvinfer.so not found.`
+  - `Install TensorRT SDK/runtime and reconfigure CMake.`
+- 不再返回假的输入透传结果，避免误判 TensorRT 推理已经可用。
+- `ctest --test-dir build --output-on-failure` 通过。
+- `include/runtime/tensorrt_backend.h`、`src/backends/tensorrt/tensorrt_backend.cpp`、`CMakeLists.txt`、`OrtBackend` 相关文件 linter 检查无新增问题。
+
+### 4. 下一步优化
+
+- 在安装 TensorRT SDK 后，验证 `MINI_INFER_TENSORRT_NATIVE=1` 路径能完成 engine 反序列化。
+- 增加 TensorRT engine binding inspection，打印输入/输出 tensor 名称、dtype 和 shape。
+- 实现 device buffer 分配、host/device 拷贝和 `enqueueV3()` 推理。
+- 增加 ONNX 到 TensorRT engine 的构建入口，或者记录使用 `trtexec` 生成 engine 的流程。

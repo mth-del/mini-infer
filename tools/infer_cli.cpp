@@ -78,6 +78,11 @@ ModelInputSpec ReadModelInputSpec(const std::string& model_path) {
     return {name.get(), tensor_info.GetShape()};
 }
 
+bool EndsWith(const std::string& text, const std::string& suffix) {
+    return text.size() >= suffix.size() &&
+           text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
 Tensor BuildInputLikeModel(const ModelInputSpec& spec) {
     std::vector<int64_t> shape = spec.shape;
     for (std::size_t i = 0; i < shape.size(); ++i) {
@@ -184,9 +189,9 @@ int main(int argc, char** argv) {
 
     for (int idx = 1; idx < argc; ++idx) {
         const std::string arg = argv[idx];
-        if (arg == "-m" && idx + 1 < argc) {
+        if ((arg == "-m" || arg == "--model") && idx + 1 < argc) {
             model_path = argv[++idx];
-        } else if (arg == "-d" && idx + 1 < argc) {
+        } else if ((arg == "-d" || arg == "--provider") && idx + 1 < argc) {
             backend_str = argv[++idx];
         } else if (arg == "-i" && idx + 1 < argc) {
             device_id = std::stoi(argv[++idx]);
@@ -206,8 +211,9 @@ int main(int argc, char** argv) {
         } else if (arg == "-h" || arg == "--help") {
             std::cout
                 << "Usage: infer_cli -m <model> -d <backend> -i <device_id> -l <repeat> [--bench [warmup] [iters]]\n"
+                << "       infer_cli --model <model.engine> --provider tensorrt\n"
                 << "  -m model path (default: models/yolov5s.onnx)\n"
-                << "  -d backend: onnx_cpu | onnx_cuda | tensorrt (default: onnx_cpu)\n"
+                << "  -d/--provider backend: onnx_cpu | onnx_cuda | tensorrt (default: onnx_cpu)\n"
                 << "  -i device id (default: 0)\n"
                 << "  -l inference repeats in normal mode (default: 1)\n"
                 << "  --bench [warmup] [iters] benchmark mode (default warmup=10 iters=50)\n";
@@ -227,11 +233,15 @@ int main(int argc, char** argv) {
     }
 
     mini_infer::ModelInputSpec input_spec;
-    try {
-        input_spec = mini_infer::ReadModelInputSpec(model_path);
-    } catch (const std::exception& e) {
-        std::cerr << "Failed to inspect model input: " << e.what() << "\n";
-        return 6;
+    if (kind == mini_infer::BackendKind::TENSORRT && mini_infer::EndsWith(model_path, ".engine")) {
+        input_spec = {"images", {1, 3, 640, 640}};
+    } else {
+        try {
+            input_spec = mini_infer::ReadModelInputSpec(model_path);
+        } catch (const std::exception& e) {
+            std::cerr << "Failed to inspect model input: " << e.what() << "\n";
+            return 6;
+        }
     }
     mini_infer::Tensor input = mini_infer::BuildInputLikeModel(input_spec);
     // Input tensor is generated from model-declared shape and filled with constant values.

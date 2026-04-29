@@ -24,9 +24,24 @@ namespace mini_infer{
     };
 
     OrtBackend::OrtBackend(std::string model_path, bool use_cuda, int device_id)
-    : model_path_(std::move(model_path)), use_cuda_(use_cuda), device_id_(device_id) {}
+    : OrtBackend(std::move(model_path), use_cuda ? OrtExecutionProvider::CUDA : OrtExecutionProvider::CPU, device_id) {}
+
+    OrtBackend::OrtBackend(std::string model_path, OrtExecutionProvider provider, int device_id)
+    : model_path_(std::move(model_path)), provider_(provider), device_id_(device_id) {}
 
     OrtBackend::~OrtBackend() = default;  // 放在 Impl 定义之后
+
+    std::string OrtBackend::name() const {
+        switch (provider_) {
+            case OrtExecutionProvider::CPU:
+                return "onnxruntime-cpu";
+            case OrtExecutionProvider::CUDA:
+                return "onnxruntime-cuda";
+            case OrtExecutionProvider::TENSORRT:
+                return "onnxruntime-tensorrt";
+        }
+        return "onnxruntime-unknown";
+    }
 
     bool OrtBackend::init() {
         try {
@@ -35,7 +50,7 @@ namespace mini_infer{
             impl_->session_options.SetGraphOptimizationLevel(
                 GraphOptimizationLevel::ORT_ENABLE_ALL);
 #ifdef MINI_INFER_ENABLE_ORT_CUDA
-                if (use_cuda_) {
+                if (provider_ == OrtExecutionProvider::CUDA) {
                     const OrtApi& api = Ort::GetApi();
                     OrtCUDAProviderOptionsV2* cuda_options = nullptr;
                     Ort::ThrowOnError(api.CreateCUDAProviderOptions(&cuda_options));

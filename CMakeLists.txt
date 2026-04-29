@@ -12,6 +12,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Paths
 # ------------------------------------------------------------------------------
 set(ONNXRUNTIME_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/src/backends/onnx")
+set(TENSORRT_ROOT "" CACHE PATH "Optional TensorRT SDK root directory")
 
 # ------------------------------------------------------------------------------
 # Build options
@@ -26,6 +27,7 @@ option(MINI_INFER_ENABLE_ONNXRUNTIME "Build ONNX Runtime backend" ON)
 add_library(mini_infer_core
     src/runtime/runtime.cpp
     src/runtime/tensor.cpp
+    src/runtime/llm_config.cpp
     src/runtime/qwen_tokenizer.cpp
     src/runtime/yolov5_postprocess.cpp
     src/graph/graph.cpp
@@ -43,6 +45,66 @@ target_link_libraries(mini_infer_core PRIVATE dl)
 if(MINI_INFER_ENABLE_TENSORRT)
     target_sources(mini_infer_core PRIVATE src/backends/tensorrt/tensorrt_backend.cpp)
     target_compile_definitions(mini_infer_core PUBLIC MINI_INFER_HAS_TENSORRT=1)
+
+    find_path(TENSORRT_INCLUDE_DIR NvInfer.h
+        HINTS
+            ${TENSORRT_ROOT}
+            ${TENSORRT_ROOT}/include
+            /usr/include
+            /usr/include/x86_64-linux-gnu
+            /usr/local/tensorrt/include
+    )
+    find_library(TENSORRT_NVINFER_LIBRARY nvinfer
+        HINTS
+            ${TENSORRT_ROOT}
+            ${TENSORRT_ROOT}/lib
+            ${TENSORRT_ROOT}/lib64
+            /usr/lib
+            /usr/lib/x86_64-linux-gnu
+            /usr/local/tensorrt/lib
+    )
+    find_library(TENSORRT_NVONNXPARSER_LIBRARY nvonnxparser
+        HINTS
+            ${TENSORRT_ROOT}
+            ${TENSORRT_ROOT}/lib
+            ${TENSORRT_ROOT}/lib64
+            /usr/lib
+            /usr/lib/x86_64-linux-gnu
+            /usr/local/tensorrt/lib
+    )
+    find_library(CUDART_LIBRARY cudart
+        HINTS
+            /usr/local/cuda/lib64
+            /usr/local/cuda-12.8/lib64
+            /usr/local/cuda-12.8/targets/x86_64-linux/lib
+            /usr/lib/x86_64-linux-gnu
+    )
+    find_path(CUDART_INCLUDE_DIR cuda_runtime_api.h
+        HINTS
+            /usr/local/cuda/include
+            /usr/local/cuda-12.8/include
+            /usr/local/cuda-12.8/targets/x86_64-linux/include
+            /usr/include
+    )
+
+    if(TENSORRT_INCLUDE_DIR AND TENSORRT_NVINFER_LIBRARY AND CUDART_LIBRARY AND CUDART_INCLUDE_DIR)
+        target_include_directories(mini_infer_core PRIVATE
+            ${TENSORRT_INCLUDE_DIR}
+            ${CUDART_INCLUDE_DIR}
+        )
+        target_link_libraries(mini_infer_core PRIVATE
+            ${TENSORRT_NVINFER_LIBRARY}
+            ${CUDART_LIBRARY}
+        )
+        if(TENSORRT_NVONNXPARSER_LIBRARY)
+            target_link_libraries(mini_infer_core PRIVATE ${TENSORRT_NVONNXPARSER_LIBRARY})
+            target_compile_definitions(mini_infer_core PRIVATE MINI_INFER_TENSORRT_HAS_ONNX_PARSER=1)
+        endif()
+        target_compile_definitions(mini_infer_core PRIVATE MINI_INFER_TENSORRT_NATIVE=1)
+        message(STATUS "Native TensorRT backend enabled: ${TENSORRT_NVINFER_LIBRARY}")
+    else()
+        message(WARNING "Native TensorRT SDK not found. TensorRT backend will build as an unavailable stub.")
+    endif()
 endif()
 
 if(MINI_INFER_ENABLE_OPENVINO)

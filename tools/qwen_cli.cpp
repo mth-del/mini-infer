@@ -11,18 +11,15 @@
 #include <unordered_map>
 #include <vector>
 
+#include "runtime/llm_config.h"
 #include "runtime/qwen_tokenizer.h"
 #include "runtime/runtime.h"
+#ifdef MINI_INFER_HAS_TENSORRT
+#include "runtime/tensorrt_backend.h"
+#endif
 #include "../src/backends/onnx/ort_backend.h"
 
 namespace {
-
-constexpr int kNumLayers = 28;
-constexpr int kNumKvHeads = 2;
-constexpr int kHeadDim = 128;
-constexpr int kVocabSize = 151936;
-constexpr int64_t kEosTokenId = 151645;
-constexpr int64_t kEndOfTextTokenId = 151643;
 
 using Clock = std::chrono::steady_clock;
 
@@ -51,22 +48,6 @@ mini_infer::Tensor MakeFloatTensor(std::string name, std::vector<int64_t> shape)
     return tensor;
 }
 
-std::string PastKeyName(int layer) {
-    return "past_key_values." + std::to_string(layer) + ".key";
-}
-
-std::string PastValueName(int layer) {
-    return "past_key_values." + std::to_string(layer) + ".value";
-}
-
-std::string PresentKeyName(int layer) {
-    return "present." + std::to_string(layer) + ".key";
-}
-
-std::string PresentValueName(int layer) {
-    return "present." + std::to_string(layer) + ".value";
-}
-
 std::vector<int64_t> Ones(std::size_t n) {
     return std::vector<int64_t>(n, 1);
 }
@@ -81,13 +62,14 @@ std::vector<int64_t> Positions(std::size_t begin, std::size_t n) {
 }
 
 std::vector<mini_infer::Tensor> BuildInputs(
+    const mini_infer::LlmModelConfig& config,
     const std::vector<int64_t>& all_token_ids,
     const std::vector<int64_t>& current_token_ids,
     const std::unordered_map<std::string, mini_infer::Tensor>& past) {
     const std::size_t past_len = all_token_ids.size() - current_token_ids.size();
 
     std::vector<mini_infer::Tensor> inputs;
-    inputs.reserve(3 + kNumLayers * 2);
+    inputs.reserve(3 + static_cast<std::size_t>(config.num_layers) * 2);
     inputs.push_back(MakeInt64Tensor(
         "input_ids",
         {1, static_cast<int64_t>(current_token_ids.size())},
@@ -101,15 +83,20 @@ std::vector<mini_infer::Tensor> BuildInputs(
         {1, static_cast<int64_t>(current_token_ids.size())},
         Positions(past_len, current_token_ids.size())));
 
-    for (int layer = 0; layer < kNumLayers; ++layer) {
-        for (const std::string& name : {PastKeyName(layer), PastValueName(layer)}) {
+    for (int layer = 0; layer < config.num_layers; ++layer) {
+        for (const std::string& name : {
+                 mini_infer::FormatLayerName(config.past_key_pattern, layer),
+                 mini_infer::FormatLayerName(config.past_value_pattern, layer)}) {
             auto it = past.find(name);
             if (it != past.end()) {
                 inputs.push_back(it->second);
             } else {
                 inputs.push_back(MakeFloatTensor(
                     name,
-                    {1, kNumKvHeads, static_cast<int64_t>(past_len), kHeadDim}));
+                    {1,
+                     config.num_kv_heads,
+                     static_cast<int64_t>(past_len),
+                     config.head_dim}));
             }
         }
     }
@@ -128,13 +115,13 @@ const mini_infer::Tensor& FindOutput(
     return *it;
 }
 
-int64_t ArgmaxLastToken(const mini_infer::Tensor& logits) {
+int64_t ArgmaxLastToken(const mini_infer::Tensor& logits, int expected_vocab_size) {
     if (logits.elem_type != mini_infer::TensorElementType::FLOAT32 || logits.shape.size() != 3) {
         throw std::runtime_error("logits must be float32 [batch, seq, vocab]");
     }
     const int64_t seq_len = logits.shape[1];
     const int64_t vocab_size = logits.shape[2];
-    if (seq_len <= 0 || vocab_size <= 0 || vocab_size != kVocabSize) {
+    if (seq_len <= 0 || vocab_size <= 0 || vocab_size != expected_vocab_size) {
         throw std::runtime_error("unexpected logits shape");
     }
     const std::size_t offset = static_cast<std::size_t>((seq_len - 1) * vocab_size);
@@ -144,16 +131,19 @@ int64_t ArgmaxLastToken(const mini_infer::Tensor& logits) {
 }
 
 std::unordered_map<std::string, mini_infer::Tensor> ExtractPast(
+    const mini_infer::LlmModelConfig& config,
     const std::vector<mini_infer::Tensor>& outputs) {
     std::unordered_map<std::string, mini_infer::Tensor> past;
-    past.reserve(kNumLayers * 2);
-    for (int layer = 0; layer < kNumLayers; ++layer) {
-        mini_infer::Tensor key = FindOutput(outputs, PresentKeyName(layer));
-        key.name = PastKeyName(layer);
+    past.reserve(static_cast<std::size_t>(config.num_layers) * 2);
+    for (int layer = 0; layer < config.num_layers; ++layer) {
+        mini_infer::Tensor key = FindOutput(
+            outputs, mini_infer::FormatLayerName(config.present_key_pattern, layer));
+        key.name = mini_infer::FormatLayerName(config.past_key_pattern, layer);
         past[key.name] = std::move(key);
 
-        mini_infer::Tensor value = FindOutput(outputs, PresentValueName(layer));
-        value.name = PastValueName(layer);
+        mini_infer::Tensor value = FindOutput(
+            outputs, mini_infer::FormatLayerName(config.present_value_pattern, layer));
+        value.name = mini_infer::FormatLayerName(config.past_value_pattern, layer);
         past[value.name] = std::move(value);
     }
     return past;
@@ -162,8 +152,9 @@ std::unordered_map<std::string, mini_infer::Tensor> ExtractPast(
 void PrintUsage(const char* argv0) {
     std::cerr << "Usage: " << argv0
               << " [--model <model.onnx>] [--vocab <vocab.json>] [--merges <merges.txt>]"
+              << " [--config <config.json>] [--generation-config <generation_config.json>]"
               << " [--prompt <text>] [--system <text>]"
-              << " [--provider cpu|cuda] [--max-new-tokens N]\n";
+              << " [--provider cpu|cuda|tensorrt] [--max-new-tokens N]\n";
 }
 
 std::string Trim(std::string text) {
@@ -220,8 +211,13 @@ std::string GpuMemorySnapshot() {
     return wrote ? result.str() : "unavailable";
 }
 
-bool IsStopToken(int64_t token_id) {
-    return token_id == kEosTokenId || token_id == kEndOfTextTokenId;
+bool IsStopToken(const mini_infer::LlmModelConfig& config, int64_t token_id) {
+    for (int64_t stop_id : config.stop_token_ids) {
+        if (token_id == stop_id) {
+            return true;
+        }
+    }
+    return false;
 }
 
 }  // namespace
@@ -230,6 +226,9 @@ int main(int argc, char** argv) {
     std::string model_path = "models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_q4.onnx";
     std::string vocab_path = "models/Qwen2.5-1.5B-Instruct-ONNX/vocab.json";
     std::string merges_path = "models/Qwen2.5-1.5B-Instruct-ONNX/merges.txt";
+    std::string config_path = "models/Qwen2.5-1.5B-Instruct-ONNX/config.json";
+    std::string generation_config_path =
+        "models/Qwen2.5-1.5B-Instruct-ONNX/generation_config.json";
     std::string prompt = "你好";
     std::string system = "You are a helpful assistant.";
     std::string provider = "cuda";
@@ -243,6 +242,10 @@ int main(int argc, char** argv) {
             vocab_path = argv[++i];
         } else if (arg == "--merges" && i + 1 < argc) {
             merges_path = argv[++i];
+        } else if (arg == "--config" && i + 1 < argc) {
+            config_path = argv[++i];
+        } else if (arg == "--generation-config" && i + 1 < argc) {
+            generation_config_path = argv[++i];
         } else if (arg == "--prompt" && i + 1 < argc) {
             prompt = argv[++i];
         } else if (arg == "--system" && i + 1 < argc) {
@@ -261,10 +264,16 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (provider != "cpu" && provider != "cuda") {
-        std::cerr << "--provider must be cpu or cuda\n";
+    if (provider != "cpu" && provider != "cuda" && provider != "tensorrt") {
+        std::cerr << "--provider must be cpu, cuda, or tensorrt\n";
         return 2;
     }
+#ifndef MINI_INFER_HAS_TENSORRT
+    if (provider == "tensorrt") {
+        std::cerr << "TensorRT backend was not enabled in this build\n";
+        return 2;
+    }
+#endif
     if (max_new_tokens < 1) {
         max_new_tokens = 1;
     }
@@ -273,12 +282,22 @@ int main(int argc, char** argv) {
         const auto total_start = Clock::now();
         const std::string gpu_before_session = GpuMemorySnapshot();
         const auto session_start = Clock::now();
+        mini_infer::LlmModelConfig model_config =
+            mini_infer::LoadLlmModelConfig(config_path, generation_config_path);
         mini_infer::QwenTokenizer tokenizer(vocab_path, merges_path);
         std::vector<int64_t> token_ids = tokenizer.EncodeChat(system, prompt);
         std::vector<int64_t> current_ids = token_ids;
         mini_infer::Runtime runtime;
-        auto backend = std::make_shared<mini_infer::OrtBackend>(
-            model_path, provider == "cuda", 0);
+        std::shared_ptr<mini_infer::Backend> backend;
+#ifdef MINI_INFER_HAS_TENSORRT
+        if (provider == "tensorrt") {
+            backend = std::make_shared<mini_infer::TensorRtBackend>(model_path, 0);
+        } else
+#endif
+        {
+            backend = std::make_shared<mini_infer::OrtBackend>(
+                model_path, provider == "cuda", 0);
+        }
         runtime.set_backend(backend);
         if (!backend->init()) {
             std::cerr << "Backend init failed\n";
@@ -305,7 +324,7 @@ int main(int argc, char** argv) {
         std::string gpu_after_prefill = "not_run";
 
         for (int step = 0; step < max_new_tokens; ++step) {
-            auto inputs = BuildInputs(token_ids, current_ids, past);
+            auto inputs = BuildInputs(model_config, token_ids, current_ids, past);
             const auto infer_start = Clock::now();
             auto outputs = runtime.infer_many(inputs);
             const auto infer_end = Clock::now();
@@ -318,7 +337,7 @@ int main(int argc, char** argv) {
             }
 
             const auto& logits = FindOutput(outputs, "logits");
-            const int64_t next_id = ArgmaxLastToken(logits);
+            const int64_t next_id = ArgmaxLastToken(logits, model_config.vocab_size);
             std::cout << "[token] step=" << step
                       << " id=" << next_id
                       << " infer_ms="
@@ -326,7 +345,7 @@ int main(int argc, char** argv) {
                       << infer_ms
                       << "\n";
 
-            if (IsStopToken(next_id)) {
+            if (IsStopToken(model_config, next_id)) {
                 std::cout << "[stop] eos_token_id=" << next_id << "\n";
                 break;
             }
@@ -338,7 +357,7 @@ int main(int argc, char** argv) {
 
             token_ids.push_back(next_id);
             current_ids = {next_id};
-            past = ExtractPast(outputs);
+            past = ExtractPast(model_config, outputs);
         }
 
         const auto total_end = Clock::now();
