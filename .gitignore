@@ -1,0 +1,30 @@
+# Build artifacts
+build/
+Testing/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Generated profiling reports
+report_infer.*
+*.nsys-rep
+*.sqlite
+
+# Model weights and downloaded model caches
+models/*
+!models/.gitkeep
+*.onnx
+*.onnx_data
+
+# ONNX Runtime binary packages are too large for normal GitHub pushes.
+# Keep headers/configuration in source control and restore shared libraries locally.
+src/backends/onnx/lib/*.so*
+src/backends/onnx/lib/*.a
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local editor/system files
+.DS_Store

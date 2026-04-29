@@ -1,0 +1,4 @@
+runtime:
+  backend: cpu
+model:
+  path: models/demo.onnx
