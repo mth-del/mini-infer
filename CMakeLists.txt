@@ -138,6 +138,24 @@ if(MINI_INFER_ENABLE_ONNXRUNTIME)
     add_executable(qwen_cli_cpp tools/qwen_cli.cpp)
     target_link_libraries(qwen_cli_cpp PRIVATE mini_infer_core)
 
+    if(MINI_INFER_ENABLE_TENSORRT
+       AND TENSORRT_INCLUDE_DIR
+       AND TENSORRT_NVINFER_LIBRARY
+       AND TENSORRT_NVONNXPARSER_LIBRARY
+       AND CUDART_LIBRARY
+       AND CUDART_INCLUDE_DIR)
+        add_executable(trt_build_engine tools/trt_build_engine.cpp)
+        target_include_directories(trt_build_engine PRIVATE
+            ${TENSORRT_INCLUDE_DIR}
+            ${CUDART_INCLUDE_DIR}
+        )
+        target_link_libraries(trt_build_engine PRIVATE
+            ${TENSORRT_NVINFER_LIBRARY}
+            ${TENSORRT_NVONNXPARSER_LIBRARY}
+            ${CUDART_LIBRARY}
+        )
+    endif()
+
     set_target_properties(infer_cli PROPERTIES
         BUILD_RPATH "\$ORIGIN/../src/backends/onnx/lib"
         INSTALL_RPATH "\$ORIGIN/../src/backends/onnx/lib"

@@ -16,7 +16,6 @@
 
 #include "runtime/llm_config.h"
 #include "runtime/qwen_tokenizer.h"
-#include "runtime/runtime.h"
 #ifdef MINI_INFER_HAS_TENSORRT
 #include "runtime/tensorrt_backend.h"
 #endif
@@ -64,6 +63,17 @@ std::vector<int64_t> Positions(std::size_t begin, std::size_t n) {
     return values;
 }
 
+std::size_t PastKvLength(const std::unordered_map<std::string, mini_infer::Tensor>& past) {
+    if (past.empty()) {
+        return 0;
+    }
+    const auto& shape = past.begin()->second.shape;
+    if (shape.size() != 4 || shape[2] < 0) {
+        throw std::runtime_error("past KV cache must have shape [batch, heads, past, head_dim]");
+    }
+    return static_cast<std::size_t>(shape[2]);
+}
+
 std::vector<mini_infer::Tensor> BuildInputs(
     const mini_infer::LlmModelConfig& config,
     const std::vector<int64_t>& all_token_ids,
@@ -77,7 +87,7 @@ std::vector<mini_infer::Tensor> BuildInputs(
     const bool use_initial_zero_past = past.empty() && initial_zero_past_len >= 0;
     const std::size_t kv_past_len = use_initial_zero_past
         ? static_cast<std::size_t>(initial_zero_past_len)
-        : token_past_len;
+        : (past.empty() ? token_past_len : PastKvLength(past));
     const std::size_t attention_len = kv_past_len + current_token_ids.size();
 
     std::vector<mini_infer::Tensor> inputs;
@@ -253,7 +263,8 @@ std::unordered_map<std::string, mini_infer::Tensor> ExtractPast(
 
 void PrintUsage(const char* argv0) {
     std::cerr << "Usage: " << argv0
-              << " [--model <model.onnx>] [--vocab <vocab.json>] [--merges <merges.txt>]"
+              << " [--model <model.onnx|prefill.engine>] [--decode-model <decode.engine>]"
+              << " [--vocab <vocab.json>] [--merges <merges.txt>]"
               << " [--config <config.json>] [--generation-config <generation_config.json>]"
               << " [--prompt <text>] [--system <text>]"
               << " [--provider cpu|cuda|tensorrt] [--max-new-tokens N]"
@@ -328,6 +339,7 @@ bool IsStopToken(const mini_infer::LlmModelConfig& config, int64_t token_id) {
 
 int main(int argc, char** argv) {
     std::string model_path = "models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_q4.onnx";
+    std::string decode_model_path;
     std::string vocab_path = "models/Qwen2.5-1.5B-Instruct-ONNX/vocab.json";
     std::string merges_path = "models/Qwen2.5-1.5B-Instruct-ONNX/merges.txt";
     std::string config_path = "models/Qwen2.5-1.5B-Instruct-ONNX/config.json";
@@ -345,6 +357,8 @@ int main(int argc, char** argv) {
         const std::string arg = argv[i];
         if (arg == "--model" && i + 1 < argc) {
             model_path = argv[++i];
+        } else if (arg == "--decode-model" && i + 1 < argc) {
+            decode_model_path = argv[++i];
         } else if (arg == "--vocab" && i + 1 < argc) {
             vocab_path = argv[++i];
         } else if (arg == "--merges" && i + 1 < argc) {
@@ -407,23 +421,30 @@ int main(int argc, char** argv) {
         mini_infer::QwenTokenizer tokenizer(vocab_path, merges_path);
         std::vector<int64_t> token_ids = tokenizer.EncodeChat(system, prompt);
         std::vector<int64_t> current_ids = token_ids;
-        mini_infer::Runtime runtime;
         std::shared_ptr<mini_infer::Backend> backend;
+        std::shared_ptr<mini_infer::Backend> decode_backend;
 #ifdef MINI_INFER_HAS_TENSORRT
         if (provider == "tensorrt") {
             backend = std::make_shared<mini_infer::TensorRtBackend>(model_path, 0);
+            if (!decode_model_path.empty()) {
+                decode_backend =
+                    std::make_shared<mini_infer::TensorRtBackend>(decode_model_path, 0);
+            }
         } else
 #endif
         {
             backend = std::make_shared<mini_infer::OrtBackend>(
                 model_path, provider == "cuda", 0);
         }
-        runtime.set_backend(backend);
         if (!backend->init()) {
             std::cerr << "Backend init failed\n";
             return 1;
         }
-        if (!runtime.load_model(model_path)) {
+        if (decode_backend && !decode_backend->init()) {
+            std::cerr << "Decode backend init failed\n";
+            return 1;
+        }
+        if (model_path.empty()) {
             std::cerr << "Failed to load model path\n";
             return 1;
         }
@@ -454,7 +475,7 @@ int main(int argc, char** argv) {
                 past,
                 initial_zero_past_len);
             const auto infer_start = Clock::now();
-            auto outputs = runtime.infer_many(inputs);
+            auto outputs = (step == 0 || !decode_backend ? backend : decode_backend)->run_many(inputs);
             const auto infer_end = Clock::now();
             const double infer_ms = MsSince(infer_start, infer_end);
             if (step == 0) {

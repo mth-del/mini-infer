@@ -1311,3 +1311,282 @@
 - 增加 TensorRT engine binding inspection，打印输入/输出 tensor 名称、dtype 和 shape。
 - 实现 device buffer 分配、host/device 拷贝和 `enqueueV3()` 推理。
 - 增加 ONNX 到 TensorRT engine 的构建入口，或者记录使用 `trtexec` 生成 engine 的流程。
+
+## 2026-04-29 TensorRT fp16 NaN 精度对照构建入口
+
+### 1. 优化背景
+
+- 前序 `past_len=1` 零 KV cache 验证仍得到 `finite_count=0`、`nan_count=151936`。
+- 这说明 NaN 不只是 0 长度动态维度 profile 导致，下一步应集中验证 TensorRT fp16 构建精度。
+- TensorRT 构建日志曾提示 self-attention 后的 layernorm 使用 FP16 Reduce/Pow 可能溢出，因此需要能快速生成精度对照 engine。
+
+### 2. 优化设计
+
+- 新增 `tools/trt_build_engine.cpp`：
+  - 使用 TensorRT native builder 和 ONNX parser 从 `model_fp16.onnx` 直接生成 `.engine`。
+  - 支持 `--precision fp32`：关闭 fp16，构建纯 FP32 对照 engine。
+  - 支持 `--precision fp16`：保持当前 fp16 构建路径，用作回归对照。
+  - 支持 `--precision fp16_fp32_sensitive`：开启 fp16，同时对名称或类型匹配 layernorm/rmsnorm/reduce/pow/sqrt 的层强制 `DataType::kFLOAT`，并开启 `kOBEY_PRECISION_CONSTRAINTS`。
+  - 支持 `--qwen-profile --seq-len N --past-len N` 自动补齐 Qwen 的 `input_ids`、`attention_mask`、`position_ids` 和 28 层 KV cache profile shape。
+- 更新 `CMakeLists.txt`：
+  - 仅在 TensorRT include、`libnvinfer`、`libnvonnxparser`、CUDA runtime 都可用时构建 `trt_build_engine`。
+  - 无 TensorRT SDK 的环境仍可正常构建已有目标，不引入硬依赖。
+
+### 3. 验证命令
+
+- 生成 FP32 prefill 对照 engine：
+  - `./build/trt_build_engine --onnx models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_fp16.onnx --engine models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_fp16_prefill_b1_s20_p1_fp32.engine --precision fp32 --qwen-profile --seq-len 20 --past-len 1`
+- 生成 fp16 + 敏感层 FP32 engine：
+  - `./build/trt_build_engine --onnx models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_fp16.onnx --engine models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_fp16_prefill_b1_s20_p1_mixed.engine --precision fp16_fp32_sensitive --qwen-profile --seq-len 20 --past-len 1`
+- 回归 logits：
+  - `./build/qwen_cli_cpp --provider tensorrt --model models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_fp16_prefill_b1_s20_p1_fp32.engine --prompt '你好' --max-new-tokens 1 --debug-logits --logits-top-k 5 --initial-zero-past-len 1`
+  - `./build/qwen_cli_cpp --provider tensorrt --model models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_fp16_prefill_b1_s20_p1_mixed.engine --prompt '你好' --max-new-tokens 1 --debug-logits --logits-top-k 5 --initial-zero-past-len 1`
+
+### 4. 预期判断
+
+- 如果 FP32 engine logits 正常，而 fp16 engine 仍全 NaN，则问题基本锁定为 TensorRT fp16 kernel/精度选择。
+- 如果 mixed engine 正常，后续保留敏感层 FP32 约束，并继续比较 ORT fp16 baseline top-k。
+- 如果 FP32 engine 仍全 NaN，则应转向 ONNX parser 图转换、attention mask 语义、Qwen 动态 KV cache shape 或 TensorRT 后端数据绑定路径。
+
+### 5. 实测结果
+
+- `trt_build_engine` 构建通过，当前环境识别到 TensorRT SDK：
+  - `Native TensorRT backend enabled: /root/autodl-tmp/tensorrt/TensorRT-10.16.1.11/lib/libnvinfer.so`
+- mixed engine 已生成到临时目录：
+  - `/root/autodl-tmp/mini-infer-engines/model_fp16_prefill_b1_s20_p1_mixed.engine`
+  - engine size: `3090423004` bytes。
+  - 强制 FP32 层数：`forced_fp32_layers=619`。
+- mixed engine 回归结果：
+  - 命令：`./build/qwen_cli_cpp --provider tensorrt --model /root/autodl-tmp/mini-infer-engines/model_fp16_prefill_b1_s20_p1_mixed.engine --prompt '你好' --max-new-tokens 1 --debug-logits --logits-top-k 5 --initial-zero-past-len 1`
+  - logits 仍为全 NaN：`finite_count=0`，`nan_count=151936`，`inf_count=0`。
+- FP32 engine 已生成到临时目录：
+  - `/root/autodl-tmp/mini-infer-engines/model_fp16_prefill_b1_s20_p1_fp32.engine`
+  - engine size: `7110395564` bytes。
+- FP32 engine 回归结果：
+  - 命令：`./build/qwen_cli_cpp --provider tensorrt --model /root/autodl-tmp/mini-infer-engines/model_fp16_prefill_b1_s20_p1_fp32.engine --prompt '你好' --max-new-tokens 1 --debug-logits --logits-top-k 5 --initial-zero-past-len 1`
+  - logits 已恢复有限值：`finite_count=151936`，`nan_count=0`，`inf_count=0`。
+  - top5：`40:17.5719,9707:16.1467,99692:15.1692,2132:14.9524,2121:14.8113`。
+  - 首 token：`40`。
+- ORT CUDA 同形状 baseline：
+  - 命令：`./build/qwen_cli_cpp --provider cuda --model models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_fp16.onnx --prompt '你好' --max-new-tokens 1 --debug-logits --logits-top-k 5 --initial-zero-past-len 1`
+  - logits 正常：`finite_count=151936`，`nan_count=0`，`inf_count=0`。
+  - top5：`40:16.1094,115546:15.1172,109024:14.4141,9707:14.2656,108386:14.125`。
+  - 首 token 同为 `40`。
+
+### 6. 新结论
+
+- `past_len=1` dummy 会改变首轮语义：同形状 ORT CUDA baseline 与 TensorRT FP32 都输出首 token `40`，因此不能再拿无 dummy past 的 `108386` 直接对比 p1 engine。
+- TensorRT FP32 engine 不再出现 NaN，说明后端数据绑定、输出拷贝、KV cache shape 和 `attention_mask=[1,21]` 路径基本可用。
+- 只把 layernorm/rmsnorm/reduce/pow/sqrt 相关层强制 FP32 仍不能修复 fp16 NaN，问题范围比最初判断更广，后续应继续缩小到 attention/matmul/softmax 相关 fp16 tactic 或直接采用 FP32 prefill + fp16 decode 的分阶段方案。
+
+## 2026-04-29 TensorRT fp16 NaN attention softmax 定位
+
+### 1. 优化背景
+
+- 前序结果已经确认：
+  - 纯 FP32 TensorRT engine 没有 NaN。
+  - `fp16_fp32_sensitive` 只强制 layernorm/rmsnorm/reduce/pow/sqrt 仍然全 NaN。
+  - 因此需要继续拆 attention/matmul/softmax 相关 fp16 tactic。
+
+### 2. 工具增强
+
+- 扩展 `tools/trt_build_engine.cpp`：
+  - 新增 `--force-fp32-pattern text`，按层名子串强制 FP32。
+  - 新增 `--force-fp32-type type`，按 TensorRT layer type 强制 FP32。
+  - 支持的类型包括：`matrix_multiply`、`softmax`、`ragged_softmax`、`elementwise`、`unary`、`reduce`、`shuffle`、`scale`。
+  - 增加浮点输出过滤，避免把 `Shape`、`Gather`、int64 `Constant` 等 shape/int64 层错误设置成 FP32。
+
+### 3. broad attention probe
+
+- 先测试 `sensitive + self_attn`：
+  - 构建命令：`./build/trt_build_engine --onnx models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_fp16.onnx --engine /root/autodl-tmp/mini-infer-engines/model_fp16_prefill_b1_s20_p1_sensitive_self_attn.engine --precision fp16_fp32_sensitive --force-fp32-pattern self_attn --qwen-profile --seq-len 20 --past-len 1`
+  - 初次构建失败：`self_attn` 名称匹配过宽，命中大量 shape/int64 层，TensorRT 不允许 `IShapeLayer` 或 int64 constant 使用 FP32。
+  - 修正浮点输出过滤后构建成功：
+    - `skipped_non_float_layers=2938`
+    - `forced_fp32_layers=1767`
+    - engine size: `3398132772` bytes。
+- logits 回归：
+  - 命令：`./build/qwen_cli_cpp --provider tensorrt --model /root/autodl-tmp/mini-infer-engines/model_fp16_prefill_b1_s20_p1_sensitive_self_attn.engine --prompt '你好' --max-new-tokens 1 --debug-logits --logits-top-k 5 --initial-zero-past-len 1`
+  - 结果：`finite_count=151936`，`nan_count=0`，`inf_count=0`。
+  - top5：`40:17.5625,9707:16.1406,99692:15.1641,2132:14.9609,115546:14.8359`。
+  - 首 token：`40`。
+
+### 4. softmax probe
+
+- 测试 `sensitive + softmax`：
+  - 构建命令：`./build/trt_build_engine --onnx models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_fp16.onnx --engine /root/autodl-tmp/mini-infer-engines/model_fp16_prefill_b1_s20_p1_sensitive_softmax.engine --precision fp16_fp32_sensitive --force-fp32-type softmax --qwen-profile --seq-len 20 --past-len 1`
+  - 构建结果：
+    - `skipped_non_float_layers=224`
+    - `forced_fp32_layers=423`
+    - engine size: `3090435372` bytes。
+- logits 回归：
+  - 命令：`./build/qwen_cli_cpp --provider tensorrt --model /root/autodl-tmp/mini-infer-engines/model_fp16_prefill_b1_s20_p1_sensitive_softmax.engine --prompt '你好' --max-new-tokens 1 --debug-logits --logits-top-k 5 --initial-zero-past-len 1`
+  - 结果：`finite_count=151936`，`nan_count=0`，`inf_count=0`。
+  - top5：`40:17.5938,9707:16.1406,99692:15.1797,2132:14.9844,115546:14.8516`。
+  - 首 token：`40`。
+
+### 5. softmax-only probe
+
+- 测试只强制 28 个 attention `Softmax` 为 FP32，不叠加 sensitive 层：
+  - 构建命令：`./build/trt_build_engine --onnx models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_fp16.onnx --engine /root/autodl-tmp/mini-infer-engines/model_fp16_prefill_b1_s20_p1_softmax_only.engine --precision fp16 --force-fp32-type softmax --qwen-profile --seq-len 20 --past-len 1`
+  - 构建结果：
+    - `forced_fp32_layers=28`
+    - TensorRT 仍提示 fp16 layernorm 风险。
+    - engine size: `3090117196` bytes。
+- logits 回归：
+  - 命令：`./build/qwen_cli_cpp --provider tensorrt --model /root/autodl-tmp/mini-infer-engines/model_fp16_prefill_b1_s20_p1_softmax_only.engine --prompt '你好' --max-new-tokens 1 --debug-logits --logits-top-k 5 --initial-zero-past-len 1`
+  - 结果：`finite_count=151936`，`nan_count=0`，`inf_count=0`。
+  - top5：`73594:14.0859,71703:12.6562,13874:12.25,39814:11.7109,110498:11.6953`。
+  - 首 token：`73594`，与 ORT CUDA 同形状 baseline 的 `40` 明显不一致。
+
+### 6. 新结论
+
+- TensorRT fp16 全 NaN 的直接触发点已经缩小到 attention `Softmax`：只把 28 个 `self_attn/Softmax` 强制 FP32 就能让 logits 从全 NaN 恢复为有限值。
+- 但 softmax-only 虽然消除 NaN，logits 分布和首 token 仍明显漂移；layernorm/rmsnorm/reduce/pow/sqrt 的 FP32 约束仍有必要用于保持数值质量。
+- 当前推荐 prefill engine 构建策略是：
+  - `--precision fp16_fp32_sensitive --force-fp32-type softmax`
+  - 这组配置避免 NaN，首 token 和 top-k 与 FP32 TensorRT / ORT CUDA p1 baseline 保持一致方向，同时 engine size 仍接近 fp16。
+
+## 2026-04-29 TensorRT prefill + decode 连续生成验证
+
+### 1. 优化背景
+
+- 前序 TensorRT 命令只能 `--max-new-tokens 1`，因为 prefill engine 固定匹配：
+  - `input_ids=[1,20]`
+  - `attention_mask=[1,21]`
+  - `past_key_values.*=[1,2,1,128]`
+- 第 2 个 token 开始进入 decode 阶段，输入变为：
+  - `input_ids=[1,1]`
+  - `attention_mask=[1,past_len+1]`
+  - `past_key_values.*=[1,2,past_len,128]`
+- 因此需要单独的 decode engine，或者 multi-profile engine。
+
+### 2. 代码调整
+
+- 更新 `tools/qwen_cli.cpp`：
+  - 新增 `--decode-model <decode.engine>`。
+  - `--provider tensorrt` 时，step 0 使用 `--model` 的 prefill engine，step >= 1 使用 `--decode-model` 的 decode engine。
+  - 修正 `--initial-zero-past-len 1` 后续 decode 的 KV 长度计算：不再只用 token 数推断 past_len，而是从上一轮 `present.*` shape 读取真实 KV 长度。
+- 更新 `tools/trt_build_engine.cpp`：
+  - Qwen profile 支持动态范围参数：
+    - `--seq-len-min/opt/max`
+    - `--past-len-min/opt/max`
+  - 仍兼容原来的 `--seq-len N --past-len N` 固定 profile。
+
+### 3. decode engine 构建
+
+- 构建命令：
+  - `./build/trt_build_engine --onnx models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_fp16.onnx --engine /root/autodl-tmp/mini-infer-engines/model_fp16_decode_b1_s1_p21_p64_sensitive_softmax.engine --precision fp16_fp32_sensitive --force-fp32-type softmax --qwen-profile --seq-len-min 1 --seq-len-opt 1 --seq-len-max 1 --past-len-min 21 --past-len-opt 24 --past-len-max 64`
+- profile 含义：
+  - decode 固定 `seq_len=1`。
+  - `past_len=21..64` 覆盖当前 p1 prefill 后的 KV 长度以及后续多 token decode。
+  - `past_len-min=21` 来自 `initial_zero_past_len=1 + prompt_len=20`。
+- 构建结果：
+  - `forced_fp32_layers=423`
+  - `skipped_non_float_layers=224`
+  - engine size: `3107145428` bytes。
+
+### 4. 连续生成验证
+
+- 运行命令：
+  - `./build/qwen_cli_cpp --provider tensorrt --model /root/autodl-tmp/mini-infer-engines/model_fp16_prefill_b1_s20_p1_sensitive_softmax.engine --decode-model /root/autodl-tmp/mini-infer-engines/model_fp16_decode_b1_s1_p21_p64_sensitive_softmax.engine --prompt '你好' --max-new-tokens 8 --debug-logits --logits-top-k 5 --initial-zero-past-len 1`
+- 每一步 logits 均为有限值：
+  - step 0：`finite_count=151936`，`nan_count=0`，`inf_count=0`，token=`40`
+  - step 1：`finite_count=151936`，`nan_count=0`，`inf_count=0`，token=`2776`
+  - step 2：`finite_count=151936`，`nan_count=0`，`inf_count=0`，token=`537`
+  - step 3：`finite_count=151936`，`nan_count=0`，`inf_count=0`，token=`2704`
+  - step 4：`finite_count=151936`，`nan_count=0`，`inf_count=0`，token=`11285`
+  - step 5：`finite_count=151936`，`nan_count=0`，`inf_count=0`，token=`448`
+  - step 6：`finite_count=151936`，`nan_count=0`，`inf_count=0`，token=`279`
+  - step 7：`finite_count=151936`，`nan_count=0`，`inf_count=0`，token=`4647`
+- 生成结果：
+  - `generated_ids`: `40 2776 537 2704 11285 448 279 4647`
+  - `assistant`: `I'm not sure familiar with the term`
+- 性能：
+  - `session_init_ms=5310.154`
+  - `prefill_ms=24.207`
+  - `decode_ms=44.280`
+  - `decode_avg_ms=6.326`
+  - `generated_tokens=8`
+  - `tokens_per_second=116.812`
+  - 显存：session 后约 `6517 MiB`。
+
+### 5. 新结论
+
+- 原生 TensorRT 路径已经从单 token prefill 验证推进到 prefill + decode 双 engine 连续生成。
+- `sensitive + softmax FP32` 策略在 prefill 和 decode 阶段均可避免 NaN。
+- 当前输出仍偏英文，语义质量不等同于 ORT CUDA baseline；后续需要继续做 TensorRT/ORT logits diff、无 dummy past prefill 导出或多 profile 组合，减少 dummy past 与 TensorRT 数值差异对生成质量的影响。
+
+## 2026-04-29 TensorRT 去掉 dummy past 后连续生成修正
+
+### 1. 问题复核
+
+- 前序 TensorRT 双 engine 连续生成输出为：
+  - `I'm not sure familiar with the term`
+- 这看起来像 TensorRT 回答错误。
+- 复核 ORT CUDA 同参数 baseline：
+  - 命令：`./build/qwen_cli_cpp --provider cuda --model models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_fp16.onnx --prompt '你好' --max-new-tokens 8 --debug-logits --logits-top-k 5 --initial-zero-past-len 1`
+  - ORT CUDA 也输出同样 token：`40 2776 537 2704 11285 448 279 4647`
+  - ORT CUDA 也输出：`I'm not sure familiar with the term`
+- 因此错误不是 TensorRT decode 独有问题，而是 `--initial-zero-past-len 1` dummy past 改变了首轮语义。
+
+### 2. 正确 baseline
+
+- ORT CUDA 不带 dummy past：
+  - 命令：`./build/qwen_cli_cpp --provider cuda --model models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_fp16.onnx --prompt '你好' --max-new-tokens 8 --debug-logits --logits-top-k 5`
+  - 首 token：`108386`
+  - `generated_ids`: `108386 6313 112169 106184 99553 100364 1773`
+  - `assistant`: `你好！很高兴为你提供帮助。`
+- 结论：要得到正确回答，TensorRT prefill 也必须使用 `past_len=0`，不能继续使用 p1 dummy past 作为最终方案。
+
+### 3. past_len=0 prefill engine
+
+- 重新构建 p0 prefill engine，保留 `sensitive + softmax FP32` 精度策略：
+  - 命令：`./build/trt_build_engine --onnx models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_fp16.onnx --engine /root/autodl-tmp/mini-infer-engines/model_fp16_prefill_b1_s20_p0_sensitive_softmax.engine --precision fp16_fp32_sensitive --force-fp32-type softmax --qwen-profile --seq-len 20 --past-len 0`
+  - 构建成功。
+  - `forced_fp32_layers=423`
+  - `skipped_non_float_layers=224`
+  - engine size: `3090365556` bytes。
+- 这个结果修正了早期 “p0 会全 NaN” 的判断：p0 原始 fp16 会 NaN，但 p0 + attention softmax FP32 + sensitive FP32 可以正常运行。
+
+### 4. past_len=20 decode engine
+
+- 对应 decode engine 的 past 范围从 `20` 开始，而不是 dummy past 场景下的 `21`：
+  - 命令：`./build/trt_build_engine --onnx models/Qwen2.5-1.5B-Instruct-ONNX/onnx/model_fp16.onnx --engine /root/autodl-tmp/mini-infer-engines/model_fp16_decode_b1_s1_p20_p64_sensitive_softmax.engine --precision fp16_fp32_sensitive --force-fp32-type softmax --qwen-profile --seq-len-min 1 --seq-len-opt 1 --seq-len-max 1 --past-len-min 20 --past-len-opt 24 --past-len-max 64`
+  - 构建成功。
+  - `forced_fp32_layers=423`
+  - `skipped_non_float_layers=224`
+  - engine size: `3107142628` bytes。
+
+### 5. TensorRT 正确连续生成命令
+
+- 正确运行命令不再带 `--initial-zero-past-len 1`：
+  - `./build/qwen_cli_cpp --provider tensorrt --model /root/autodl-tmp/mini-infer-engines/model_fp16_prefill_b1_s20_p0_sensitive_softmax.engine --decode-model /root/autodl-tmp/mini-infer-engines/model_fp16_decode_b1_s1_p20_p64_sensitive_softmax.engine --prompt '你好' --max-new-tokens 8 --debug-logits --logits-top-k 5`
+- 结果：
+  - step 0：`finite_count=151936`，`nan_count=0`，token=`108386`
+  - step 1：`finite_count=151936`，`nan_count=0`，token=`6313`
+  - step 2：`finite_count=151936`，`nan_count=0`，token=`112169`
+  - step 3：`finite_count=151936`，`nan_count=0`，token=`106184`
+  - step 4：`finite_count=151936`，`nan_count=0`，token=`99553`
+  - step 5：`finite_count=151936`，`nan_count=0`，token=`100364`
+  - step 6：`finite_count=151936`，`nan_count=0`，token=`1773`
+  - step 7：`finite_count=151936`，`nan_count=0`，token=`151645`，命中 stop token。
+- 生成结果：
+  - `generated_ids`: `108386 6313 112169 106184 99553 100364 1773`
+  - `assistant`: `你好！很高兴为你提供帮助。`
+- 性能：
+  - `session_init_ms=5757.907`
+  - `prefill_ms=36.607`
+  - `decode_ms=54.274`
+  - `decode_avg_ms=9.046`
+  - `tokens_per_second=77.024`
+  - 显存：session 后约 `6517 MiB`。
+
+### 6. 新结论
+
+- 之前回答错误的根因是 dummy past，不是 TensorRT 双 engine decode 链路。
+- 最终推荐使用：
+  - p0 prefill engine：`model_fp16_prefill_b1_s20_p0_sensitive_softmax.engine`
+  - p20+ decode engine：`model_fp16_decode_b1_s1_p20_p64_sensitive_softmax.engine`
+  - 运行时不要带 `--initial-zero-past-len 1`。
+- 这样 TensorRT 可以连续生成，并与 ORT CUDA baseline 在 greedy token 序列上对齐。
