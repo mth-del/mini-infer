@@ -23,6 +23,7 @@ src/backends/onnx/lib/*.so*
 src/backends/onnx/lib/*.a
 
 # Python cache
+.venv/
 __pycache__/
 *.py[cod]
 

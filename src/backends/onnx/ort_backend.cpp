@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <iostream>
 #include "onnxruntime_cxx_api.h"
@@ -32,7 +33,7 @@ namespace mini_infer{
             impl_ = std::make_unique<Impl>();
             impl_->session_options.SetIntraOpNumThreads(1);
             impl_->session_options.SetGraphOptimizationLevel(
-                GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
+                GraphOptimizationLevel::ORT_ENABLE_ALL);
 #ifdef MINI_INFER_ENABLE_ORT_CUDA
                 if (use_cuda_) {
                     const OrtApi& api = Ort::GetApi();
@@ -91,7 +92,7 @@ namespace mini_infer{
     }
 
 
-    Tensor OrtBackend::run(const std::vector<Tensor>& inputs) {
+    std::vector<Tensor> OrtBackend::run_many(const std::vector<Tensor>& inputs) {
 
         if (!impl_ || !impl_->session) {
             throw std::runtime_error("OrtBackend is not initialized");
@@ -100,86 +101,130 @@ namespace mini_infer{
             throw std::runtime_error("OrtBackend::run got empty inputs");
         }
 
-        const Tensor& in = inputs[0];
-        if (in.shape.empty() || in.data.empty()) {
-            throw std::runtime_error("input tensor shape/data is empty");
-        }
-        auto input_type = impl_->session->GetInputTypeInfo(0);
-        auto input_tensor_info = input_type.GetTensorTypeAndShapeInfo();
-        ONNXTensorElementDataType elem_type = input_tensor_info.GetElementType();
-
-        std::cerr << "input_count=" << impl_->session->GetInputCount() << "\n";
-        std::cerr << "input0_name=" << impl_->input_names_str[0] << "\n";
-        std::cerr << "input0_elem_type=" << static_cast<int>(elem_type) << "\n";
-
-        
-        std::vector<Ort::Value> ort_inputs;
-        ort_inputs.reserve(1);
-        
-        // 需要让 fp16 buffer 生命周期覆盖 Run()
-        std::vector<Ort::Float16_t> input_fp16;
-
-        if (elem_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-            Ort::Value x = Ort::Value::CreateTensor<float>(
-                impl_->memory_info,
-                const_cast<float*>(in.data.data()),
-                in.data.size(),
-                in.shape.data(),
-                in.shape.size());
-            ort_inputs.emplace_back(std::move(x));
-        } else if (elem_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
-            input_fp16.resize(in.data.size());
-            for (size_t i = 0; i < in.data.size(); ++i) {
-                input_fp16[i] = Ort::Float16_t(in.data[i]);
+        std::unordered_map<std::string, const Tensor*> input_by_name;
+        for (const Tensor& input : inputs) {
+            if (!input.name.empty()) {
+                input_by_name[input.name] = &input;
             }
-            Ort::Value x = Ort::Value::CreateTensor<Ort::Float16_t>(
-                impl_->memory_info,
-                input_fp16.data(),
-                input_fp16.size(),
-                in.shape.data(),
-                in.shape.size());
-            ort_inputs.emplace_back(std::move(x));
-        } else {
-            throw std::runtime_error("Unsupported model input element type");
+        }
+
+        std::vector<Ort::Value> ort_inputs;
+        ort_inputs.reserve(inputs.size());
+        std::vector<const char*> run_input_names;
+        run_input_names.reserve(inputs.size());
+
+        // Temporary buffers must live until Session::Run() returns.
+        std::vector<std::vector<Ort::Float16_t>> input_fp16_buffers;
+        input_fp16_buffers.reserve(inputs.size());
+
+        for (std::size_t i = 0; i < inputs.size(); ++i) {
+            const std::string& model_input_name = i < impl_->input_names_str.size()
+                ? impl_->input_names_str[i]
+                : inputs[i].name;
+            const Tensor* input = nullptr;
+            if (!inputs[i].name.empty()) {
+                input = &inputs[i];
+            } else if (!model_input_name.empty()) {
+                auto it = input_by_name.find(model_input_name);
+                input = it == input_by_name.end() ? &inputs[i] : it->second;
+            } else {
+                input = &inputs[i];
+            }
+
+            if (!input || input->shape.empty()) {
+                throw std::runtime_error("input tensor shape is empty");
+            }
+            // 支持长度为0的初始化KV cache
+            if (input->data_size() == 0 && input->numel() != 0) {
+                throw std::runtime_error("input tensor data is empty but shape is non-empty");
+            }
+
+            run_input_names.push_back(input->name.empty() ? model_input_name.c_str() : input->name.c_str());
+
+            switch (input->elem_type) {
+                case TensorElementType::FLOAT32: {
+                    Ort::Value x = Ort::Value::CreateTensor<float>(
+                        impl_->memory_info,
+                        const_cast<float*>(input->data.data()),
+                        input->data.size(),
+                        input->shape.data(),
+                        input->shape.size());
+                    ort_inputs.emplace_back(std::move(x));
+                    break;
+                }
+                case TensorElementType::FLOAT16: {
+                    input_fp16_buffers.emplace_back(input->data.size());
+                    auto& input_fp16 = input_fp16_buffers.back();
+                    for (size_t j = 0; j < input->data.size(); ++j) {
+                        input_fp16[j] = Ort::Float16_t(input->data[j]);
+                    }
+                    Ort::Value x = Ort::Value::CreateTensor<Ort::Float16_t>(
+                        impl_->memory_info,
+                        input_fp16.data(),
+                        input_fp16.size(),
+                        input->shape.data(),
+                        input->shape.size());
+                    ort_inputs.emplace_back(std::move(x));
+                    break;
+                }
+                case TensorElementType::INT64: {
+                    Ort::Value x = Ort::Value::CreateTensor<int64_t>(
+                        impl_->memory_info,
+                        const_cast<int64_t*>(input->int64_data.data()),
+                        input->int64_data.size(),
+                        input->shape.data(),
+                        input->shape.size());
+                    ort_inputs.emplace_back(std::move(x));
+                    break;
+                }
+            }
         }
         
         auto ort_outputs = impl_->session->Run(
             Ort::RunOptions{nullptr},
-            impl_->input_names.data(),
+            run_input_names.data(),
             ort_inputs.data(),
             ort_inputs.size(),
             impl_->output_names.data(),
             impl_->output_names.size());
 
-        // 当前最小实现：取第一个输出
-        Ort::Value& out0 = ort_outputs[0];
-        if (!out0.IsTensor()) {
-            throw std::runtime_error("ORT output[0] is not a tensor");
-        }
-        auto type_info = out0.GetTensorTypeAndShapeInfo();
-        auto out_elem_type = type_info.GetElementType();
-        std::vector<int64_t> out_shape = type_info.GetShape();
-        size_t out_numel = type_info.GetElementCount();
-        const float* out_data = out0.GetTensorData<float>();
-        Tensor out;
-        out.name = impl_->output_names_str.empty() ? "output0" : impl_->output_names_str[0];
-        out.shape = std::move(out_shape);
-        out.data.resize(out_numel);
-
-        if (out_elem_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-            const float* out_data = out0.GetTensorData<float>();
-            out.data.assign(out_data, out_data + out_numel);
-        } else if (out_elem_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
-            const Ort::Float16_t* out_data = out0.GetTensorData<Ort::Float16_t>();
-            for (size_t i = 0; i < out_numel; ++i) {
-                out.data[i] = static_cast<float>(out_data[i]);
+        std::vector<Tensor> outputs;
+        outputs.reserve(ort_outputs.size());
+        for (std::size_t i = 0; i < ort_outputs.size(); ++i) {
+            Ort::Value& ort_output = ort_outputs[i];
+            if (!ort_output.IsTensor()) {
+                throw std::runtime_error("ORT output is not a tensor");
             }
-        } else {
-            throw std::runtime_error("Unsupported model output element type");
-        }
-    
 
-        return out;
+            auto type_info = ort_output.GetTensorTypeAndShapeInfo();
+            auto out_elem_type = type_info.GetElementType();
+            const std::size_t out_numel = type_info.GetElementCount();
+
+            Tensor out;
+            out.name = i < impl_->output_names_str.size() ? impl_->output_names_str[i] : "output";
+            out.shape = type_info.GetShape();
+
+            if (out_elem_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+                out.elem_type = TensorElementType::FLOAT32;
+                const float* out_data = ort_output.GetTensorData<float>();
+                out.data.assign(out_data, out_data + out_numel);
+            } else if (out_elem_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+                out.elem_type = TensorElementType::FLOAT16;
+                const Ort::Float16_t* out_data = ort_output.GetTensorData<Ort::Float16_t>();
+                out.data.resize(out_numel);
+                for (size_t j = 0; j < out_numel; ++j) {
+                    out.data[j] = static_cast<float>(out_data[j]);
+                }
+            } else if (out_elem_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
+                out.elem_type = TensorElementType::INT64;
+                const int64_t* out_data = ort_output.GetTensorData<int64_t>();
+                out.int64_data.assign(out_data, out_data + out_numel);
+            } else {
+                throw std::runtime_error("Unsupported model output element type");
+            }
+            outputs.emplace_back(std::move(out));
+        }
+        return outputs;
     }
     
 

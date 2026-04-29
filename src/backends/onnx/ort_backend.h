@@ -11,7 +11,7 @@ namespace mini_infer {
         ~OrtBackend() override;   // 显式声明
         std::string name() const override { return use_cuda_ ? "onnxruntime-cuda" : "onnxruntime-cpu"; }
         bool init() override;
-        Tensor run(const std::vector<Tensor>& inputs) override;
+        std::vector<Tensor> run_many(const std::vector<Tensor>& inputs) override;
     private:
         std::string model_path_;
         bool use_cuda_{false};

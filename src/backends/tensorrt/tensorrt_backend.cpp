@@ -25,7 +25,7 @@ bool TensorRtBackend::init() {
     return true;
 }
 
-Tensor TensorRtBackend::run(const std::vector<Tensor>& inputs) {
+std::vector<Tensor> TensorRtBackend::run_many(const std::vector<Tensor>& inputs) {
     if (!ready_) {
         throw std::runtime_error("TensorRtBackend is not initialized");
     }
@@ -34,7 +34,7 @@ Tensor TensorRtBackend::run(const std::vector<Tensor>& inputs) {
     }
     // TODO: Replace with real TensorRT engine execution.
     // For now, keep shape-compatible behavior and make backend selectable.
-    return inputs.front();
+    return {inputs.front()};
 }
 
 }  // namespace mini_infer

@@ -26,6 +26,7 @@ option(MINI_INFER_ENABLE_ONNXRUNTIME "Build ONNX Runtime backend" ON)
 add_library(mini_infer_core
     src/runtime/runtime.cpp
     src/runtime/tensor.cpp
+    src/runtime/qwen_tokenizer.cpp
     src/runtime/yolov5_postprocess.cpp
     src/graph/graph.cpp
     src/memory/allocator.cpp
@@ -67,7 +68,23 @@ add_executable(infer_cli tools/infer_cli.cpp)
 target_link_libraries(infer_cli PRIVATE mini_infer_core)
 
 if(MINI_INFER_ENABLE_ONNXRUNTIME)
+    add_executable(onnx_model_info tools/onnx_model_info.cpp)
+    target_include_directories(onnx_model_info PRIVATE ${ONNXRUNTIME_ROOT}/include)
+    target_link_libraries(onnx_model_info PRIVATE
+        "${ONNXRUNTIME_ROOT}/lib/libonnxruntime.so"
+    )
+    add_executable(qwen_cli_cpp tools/qwen_cli.cpp)
+    target_link_libraries(qwen_cli_cpp PRIVATE mini_infer_core)
+
     set_target_properties(infer_cli PROPERTIES
+        BUILD_RPATH "\$ORIGIN/../src/backends/onnx/lib"
+        INSTALL_RPATH "\$ORIGIN/../src/backends/onnx/lib"
+    )
+    set_target_properties(onnx_model_info PROPERTIES
+        BUILD_RPATH "\$ORIGIN/../src/backends/onnx/lib"
+        INSTALL_RPATH "\$ORIGIN/../src/backends/onnx/lib"
+    )
+    set_target_properties(qwen_cli_cpp PROPERTIES
         BUILD_RPATH "\$ORIGIN/../src/backends/onnx/lib"
         INSTALL_RPATH "\$ORIGIN/../src/backends/onnx/lib"
     )

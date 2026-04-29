@@ -13,7 +13,7 @@ public:
 
     std::string name() const override { return "tensorrt-native"; }
     bool init() override;
-    Tensor run(const std::vector<Tensor>& inputs) override;
+    std::vector<Tensor> run_many(const std::vector<Tensor>& inputs) override;
 
 private:
     std::string model_path_;

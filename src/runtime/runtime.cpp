@@ -20,4 +20,11 @@ Tensor Runtime::infer(const std::vector<Tensor>& inputs) {
     return backend_->run(inputs);
 }
 
+std::vector<Tensor> Runtime::infer_many(const std::vector<Tensor>& inputs) {
+    if (!backend_) {
+        throw std::runtime_error("Backend is not set");
+    }
+    return backend_->run_many(inputs);
+}
+
 }  // namespace mini_infer

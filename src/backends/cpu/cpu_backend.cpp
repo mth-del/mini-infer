@@ -7,11 +7,11 @@ public:
     std::string name() const override { return "cpu"; }
     bool init() override { return true; }
 
-    Tensor run(const std::vector<Tensor>& inputs) override {
+    std::vector<Tensor> run_many(const std::vector<Tensor>& inputs) override {
         if (inputs.empty()) {
             return {};
         }
-        return inputs.front();
+        return {inputs.front()};
     }
 };
 
